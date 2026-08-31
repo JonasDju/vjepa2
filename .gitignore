@@ -1,5 +1,6 @@
 *.pyc
 .vscode/
+.idea/
 .*.swp
 
 run_vjepa_aws.py

@@ -15,6 +15,7 @@ import submitit
 import yaml
 
 from app.scaffold import main as app_main
+from src.utils.config import expand_env_vars
 from src.utils.logging import get_logger, git_information
 
 logger = get_logger(force=True)
@@ -73,7 +74,9 @@ class Trainer:
 
     def __call__(self):
         app = self.app
-        params = self.args_pretrain
+        # Expand $VAR / ~ in the config now (runs on the compute node, so job-local
+        # vars such as $TMPDIR resolve to the right value).
+        params = expand_env_vars(self.args_pretrain)
         load_model = self.load_model
 
         logger.info("loaded pretrain params...")
@@ -232,6 +235,9 @@ def launch():
     for f in config_fnames:
         with open(f, "r") as y_file:
             _params = yaml.load(y_file, Loader=yaml.FullLoader)
+            # Resolve $VAR / ~ so submit-time paths (e.g. `folder`) are usable here;
+            # Trainer.__call__ re-expands on the compute node for job-local vars.
+            _params = expand_env_vars(_params)
             if args.use_fname_as_folder:
                 assert not args.folder, "Don't specify --folder if adding fname to folder"
                 _params["folder"] = str(Path(_params["folder"]) / f.split("/")[-1].split(".yaml")[0])

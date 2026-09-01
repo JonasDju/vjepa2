@@ -11,6 +11,7 @@ from pathlib import Path
 import yaml
 
 from app.scaffold import main as app_main
+from src.utils.config import expand_env_vars
 from src.utils.distributed import init_distributed
 
 parser = argparse.ArgumentParser()
@@ -53,6 +54,7 @@ def process_main(rank, fname, world_size, devices):
     params = None
     with open(fname, "r") as y_file:
         params = yaml.load(y_file, Loader=yaml.FullLoader)
+        params = expand_env_vars(params)
         logger.info("loaded params...")
 
     # Log config

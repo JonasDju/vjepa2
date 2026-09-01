@@ -33,6 +33,7 @@ from app.vjepa_2_1.utils import (
 from src.datasets.data_manager import init_data
 from src.masks.multiseq_multiblock3d import MaskCollator
 from src.masks.utils import apply_masks
+from src.utils.config import expand_env_vars
 from src.utils.distributed import init_distributed
 from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
 from torch.nn.parallel import DistributedDataParallel
@@ -58,6 +59,11 @@ def main(args, resume_preempt=False):
     # ----------------------------------------------------------------------- #
     #  PASSED IN PARAMS FROM CONFIG FILE
     # ----------------------------------------------------------------------- #
+
+    # Resolve $VAR / ${VAR} / ~ in every string value of the config (idempotent if
+    # an entrypoint already did it). Runs on the compute node, so job-local vars
+    # such as $TMPDIR / $TMP resolve correctly.
+    args = expand_env_vars(args)
 
     # -- META
     folder = args.get("folder")

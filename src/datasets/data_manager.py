@@ -37,6 +37,9 @@ def init_data(
     persistent_workers=False,
     deterministic=True,
     log_dir=None,
+    data_root=None,
+    data_meta=None,
+    series_depth=0,
 ):
     if data.lower() == "imagenet":
         from src.datasets.imagenet1k import make_imagenet1k
@@ -81,6 +84,26 @@ def init_data(
             persistent_workers=persistent_workers,
             world_size=world_size,
             rank=rank,
+            deterministic=deterministic,
+            log_dir=log_dir,
+        )
+
+    elif data.lower() == "midataset":
+        from src.datasets.mi_dataset import make_MIDataset
+
+        dataset, data_loader, dist_sampler = make_MIDataset(
+            data_root=data_root,
+            data_meta=data_meta,
+            batch_size=batch_size,
+            transform=transform,
+            series_depth=series_depth,
+            collator=collator,
+            num_workers=num_workers,
+            pin_mem=pin_mem,
+            persistent_workers=persistent_workers,
+            world_size=world_size,
+            rank=rank,
+            drop_last=drop_last,
             deterministic=deterministic,
             log_dir=log_dir,
         )

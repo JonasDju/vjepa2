@@ -69,6 +69,7 @@ def main(args, resume_preempt=False):
     skip_batches = cfgs_meta.get("skip_batches", -1)
     use_sdpa = cfgs_meta.get("use_sdpa", False)
     sync_gc = cfgs_meta.get("sync_gc", False)
+    enc_static_graph = cfgs_meta.get("enc_static_graph", True)
     logger.info(f"LD_PRELOAD: {os.environ.get('LD_PRELOAD')}")
     which_dtype = cfgs_meta.get("dtype")
     logger.info(f"{which_dtype=}")
@@ -114,8 +115,12 @@ def main(args, resume_preempt=False):
     normalize_predictor = cfgs_model.get("normalize_predictor", False)
     modality_embedding = cfgs_model.get("modality_embedding", False)
     levels_predictor = cfgs_model.get("levels_predictor", 4)
-    if model_name == "vit_large":
+    if model_name == "vit_base":
+        embed_dim_encoder = 768
+    elif model_name == "vit_large":
         embed_dim_encoder = 1024
+    elif model_name == "vit_huge":
+        embed_dim_encoder = 1280
     elif model_name == "vit_giant_xformers":
         embed_dim_encoder = 1408
     elif model_name == "vit_gigantic_xformers":
@@ -128,8 +133,25 @@ def main(args, resume_preempt=False):
     dataset_type = cfgs_data.get("dataset_type", "videodataset")
     dataset_paths = cfgs_data.get("datasets", [])
     datasets_weights = cfgs_data.get("datasets_weights")
-    dataset_fpcs = cfgs_data.get("dataset_fpcs")
+    persistent_workers = cfgs_data.get("persistent_workers", False)
+    is_mi_dataset = dataset_type.lower() == "midataset"
+    # -- MI (medical imaging) dataset: folders of JPEG slices loaded as 3D volumes
+    mi_data_root = cfgs_data.get("data_root")
+    mi_data_meta = cfgs_data.get("data_meta")
+    # series_depth <= 0 -> keep every slice (depth-bucketing sampler);
+    # series_depth > 0 -> resample each volume to this many slices
+    series_depth = cfgs_data.get("series_depth", 0)
+    if is_mi_dataset:
+        if series_depth and series_depth > 0:
+            dataset_fpcs = [series_depth]
+        else:
+            from src.datasets.mi_dataset import get_series_depths
+
+            dataset_fpcs = get_series_depths(mi_data_meta)
+    else:
+        dataset_fpcs = cfgs_data.get("dataset_fpcs")
     max_num_frames = max(dataset_fpcs)
+    in_chans = 1 if is_mi_dataset else 3
     batch_size = cfgs_data.get("batch_size")
     tubelet_size = cfgs_data.get("tubelet_size")
     fps = cfgs_data.get("fps")
@@ -335,6 +357,7 @@ def main(args, resume_preempt=False):
         patch_size=patch_size,
         max_num_frames=max_num_frames,
         tubelet_size=model_tubelet_size,
+        in_chans=in_chans,
         model_name=model_name,
         crop_size=crop_size,
         pred_depth=pred_depth,
@@ -375,6 +398,11 @@ def main(args, resume_preempt=False):
         tubelet_size=tubelet_size,
     )
 
+    if is_mi_dataset:
+        # single-channel grayscale volumes -> single-value normalize (~maps [0, 255] to [-1, 1])
+        normalize = ((0.5,), (0.5,))
+    else:
+        normalize = ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
     transform = make_transforms(
         random_horizontal_flip=True,
         random_resize_aspect_ratio=ar_range,
@@ -383,6 +411,7 @@ def main(args, resume_preempt=False):
         auto_augment=use_aa,
         motion_shift=motion_shift,
         crop_size=crop_size,
+        normalize=normalize,
     )
 
     # -- init data-loaders/samplers
@@ -401,6 +430,10 @@ def main(args, resume_preempt=False):
         collator=mask_collator,
         num_workers=num_workers,
         pin_mem=pin_mem,
+        persistent_workers=persistent_workers,
+        data_root=mi_data_root,
+        data_meta=mi_data_meta,
+        series_depth=series_depth,
         log_dir=None,
     )
     try:
@@ -436,7 +469,7 @@ def main(args, resume_preempt=False):
         betas=betas,
         eps=eps,
     )
-    encoder = DistributedDataParallel(encoder, static_graph=True)
+    encoder = DistributedDataParallel(encoder, static_graph=enc_static_graph)
     predictor = DistributedDataParallel(
         predictor, static_graph=False, find_unused_parameters=True
     )

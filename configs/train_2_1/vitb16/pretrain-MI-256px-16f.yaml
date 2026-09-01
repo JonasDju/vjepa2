@@ -3,12 +3,13 @@ nodes: 8
 tasks_per_node: 8
 cpus_per_task: 8
 mem_per_gpu: 220G
-folder: /your_folder/pretrain_2_1/16.8.vitb.256px.16f
+folder: /hpcwork/va105917/vjepa/pretrain_2_1/16.8.vitb.256px.16f
 data:
   dataset_type: MIDataset
-  data_root: /your_data/mi_series_root
-  data_meta: /your_data/metadata.json
+  data_root: /dev/shm/kneeno_data
+  data_meta: /hpcwork/p0021834/workspace_roman/jonas/BigKneeTar/metadata.json
   series_depth: 0
+  resample_mode: nearest  # only used when series_depth > 0: "nearest" or "interpolate"
   batch_size: 48
   crop_size: 256
   patch_size: 16
@@ -102,7 +103,7 @@ optimization:
   ema:
   - 0.99925
   - 0.99925
-  epochs: 1000
+  epochs: 200
   final_lr: 0.0006
   final_weight_decay: 0.04
   ipe: 300

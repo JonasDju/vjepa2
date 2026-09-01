@@ -141,6 +141,8 @@ def main(args, resume_preempt=False):
     # series_depth <= 0 -> keep every slice (depth-bucketing sampler);
     # series_depth > 0 -> resample each volume to this many slices
     series_depth = cfgs_data.get("series_depth", 0)
+    # depth-resampling method when series_depth > 0: "nearest" or "interpolate"
+    resample_mode = cfgs_data.get("resample_mode", "nearest")
     if is_mi_dataset:
         if series_depth and series_depth > 0:
             dataset_fpcs = [series_depth]
@@ -434,6 +436,7 @@ def main(args, resume_preempt=False):
         data_root=mi_data_root,
         data_meta=mi_data_meta,
         series_depth=series_depth,
+        resample_mode=resample_mode,
         log_dir=None,
     )
     try:

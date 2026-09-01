@@ -17,6 +17,8 @@ from PIL import Image
 _GLOBAL_SEED = 0
 logger = getLogger()
 
+RESAMPLE_MODES = ("nearest", "interpolate")
+
 
 def _load_metadata(data_meta):
     with open(data_meta, "r") as f:
@@ -62,6 +64,7 @@ class MIDataset(torch.utils.data.Dataset):
         data_meta,
         transform=None,
         series_depth=0,
+        resample_mode="nearest",
         min_series_len=2,
         max_series_len=None,
     ):
@@ -69,6 +72,14 @@ class MIDataset(torch.utils.data.Dataset):
         self.transform = transform
         # series_depth <= 0 -> keep every slice; > 0 -> resample volume to this depth
         self.series_depth = series_depth if (series_depth and series_depth > 0) else 0
+        # how to resample along depth when series_depth > 0:
+        #   "nearest"     -> nearest-slice pick (slices dropped/duplicated, no new values)
+        #   "interpolate" -> linear interpolation along the depth axis
+        if resample_mode not in RESAMPLE_MODES:
+            raise ValueError(
+                f"resample_mode must be one of {RESAMPLE_MODES}, got {resample_mode!r}"
+            )
+        self.resample_mode = resample_mode
 
         metadata = _load_metadata(data_meta)
         self.samples = list(
@@ -104,11 +115,24 @@ class MIDataset(torch.utils.data.Dataset):
         vol = np.stack(slices, axis=0)  # (L, H, W)
 
         if self.series_depth > 0 and vol.shape[0] != self.series_depth:
-            idx = np.linspace(0, vol.shape[0] - 1, self.series_depth).round().astype(int)
-            vol = vol[idx]
+            vol = self._resample_depth(vol)
 
         vol = vol[..., None]  # (L, H, W, 1)
         return vol
+
+    def _resample_depth(self, vol):
+        """Resample ``vol`` (L, H, W) along the depth axis to ``self.series_depth`` slices."""
+        if self.resample_mode == "nearest":
+            idx = np.linspace(0, vol.shape[0] - 1, self.series_depth).round().astype(int)
+            return vol[idx]
+
+        # "interpolate": linear interpolation along depth (H, W kept unchanged).
+        _, h, w = vol.shape
+        t = torch.from_numpy(np.ascontiguousarray(vol)).float()[None, None]  # (1, 1, L, H, W)
+        t = torch.nn.functional.interpolate(
+            t, size=(self.series_depth, h, w), mode="trilinear", align_corners=True
+        )
+        return t[0, 0].numpy()  # (series_depth, H, W) float32
 
     def __getitem__(self, index):
         # Keep trying until a series loads successfully (mirrors VideoDataset).
@@ -207,6 +231,7 @@ def make_MIDataset(
     batch_size,
     transform=None,
     series_depth=0,
+    resample_mode="nearest",
     rank=0,
     world_size=1,
     collator=None,
@@ -224,6 +249,7 @@ def make_MIDataset(
         data_meta=data_meta,
         transform=transform,
         series_depth=series_depth,
+        resample_mode=resample_mode,
         min_series_len=min_series_len,
         max_series_len=max_series_len,
     )

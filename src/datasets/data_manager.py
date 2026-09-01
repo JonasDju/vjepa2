@@ -40,6 +40,7 @@ def init_data(
     data_root=None,
     data_meta=None,
     series_depth=0,
+    resample_mode="nearest",
 ):
     if data.lower() == "imagenet":
         from src.datasets.imagenet1k import make_imagenet1k
@@ -97,6 +98,7 @@ def init_data(
             batch_size=batch_size,
             transform=transform,
             series_depth=series_depth,
+            resample_mode=resample_mode,
             collator=collator,
             num_workers=num_workers,
             pin_mem=pin_mem,

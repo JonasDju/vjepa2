@@ -6,9 +6,9 @@ mem_per_gpu: 220G
 folder: /hpcwork/va105917/vjepa/pretrain_2_1/16.8.vitb.256px.16f
 data:
   dataset_type: MIDataset
-  data_root: /dev/shm/kneeno_data
+  data_root: $TMP/kneeno_data
   data_meta: /hpcwork/p0021834/workspace_roman/jonas/BigKneeTar/metadata.json
-  series_depth: 0
+  series_depth: 24
   resample_mode: nearest  # only used when series_depth > 0: "nearest" or "interpolate"
   batch_size: 48
   crop_size: 256

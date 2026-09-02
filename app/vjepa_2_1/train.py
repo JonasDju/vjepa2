@@ -45,6 +45,25 @@ CHECKPOINT_FREQ = 1
 GARBAGE_COLLECT_ITR_FREQ = 50
 MAX_REPEAT_COUNTS = 10
 
+
+def compute_grad_norm(parameters, norm_type=2.0):
+    """Global gradient norm over ``parameters`` -- diagnostics only.
+
+    Read-only: unlike ``torch.nn.utils.clip_grad_norm_`` this never rescales the
+    gradients (and never raises on a non-finite norm), so it does not change training
+    behaviour. Returns a python float (may be ``inf``/``nan``).
+    """
+    grads = [p.grad.detach() for p in parameters if p.grad is not None]
+    if not grads:
+        return 0.0
+    device = grads[0].device
+    total = torch.norm(
+        torch.stack([torch.norm(g.float(), norm_type).to(device) for g in grads]),
+        norm_type,
+    )
+    return float(total)
+
+
 _GLOBAL_SEED = 0
 random.seed(_GLOBAL_SEED)
 np.random.seed(_GLOBAL_SEED)
@@ -350,6 +369,7 @@ def main(args, resume_preempt=False):
         ("%d", "epoch"),
         ("%d", "itr"),
         ("%.5f", "loss"),
+        ("%.4e", "grad-norm"),
         ("%d", "iter-time(ms)"),
         ("%d", "gpu-time(ms)"),
         ("%d", "dataload-time(ms)"),
@@ -568,6 +588,7 @@ def main(args, resume_preempt=False):
         logger.info("Epoch %d" % (epoch + 1))
 
         loss_meter = AverageMeter()
+        grad_norm_meter = AverageMeter()
         mask_meters = {fpc: AverageMeter() for fpc in dataset_fpcs}
         iter_time_meter = AverageMeter()
         gpu_time_meter = AverageMeter()
@@ -762,12 +783,18 @@ def main(args, resume_preempt=False):
                             f"Loss {loss} is above bound {meanval} + {loss_reg_std_mult} * {stdval}. Skipping step."
                         )
 
+                grad_norm = float("nan")
                 if run_step:
                     if mixed_precision:
                         scaler.scale(loss).backward()
                         scaler.unscale_(optimizer)
                     else:
                         loss.backward()
+                    # -- diagnostics only: measure the (true-scale) global grad norm
+                    #    after unscaling and before the optimizer step. Does not clip.
+                    grad_norm = compute_grad_norm(
+                        list(encoder.parameters()) + list(predictor.parameters())
+                    )
                     if mixed_precision:
                         scaler.step(optimizer)
                         scaler.update()
@@ -793,6 +820,7 @@ def main(args, resume_preempt=False):
                     _new_lr,
                     _new_wd,
                     run_step,
+                    grad_norm,
                 )
 
             (
@@ -800,9 +828,12 @@ def main(args, resume_preempt=False):
                 _new_lr,
                 _new_wd,
                 run_step,
+                grad_norm,
             ), gpu_etime_ms = gpu_timer(train_step)
             iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
             loss_meter.update(loss)
+            if np.isfinite(grad_norm):
+                grad_norm_meter.update(grad_norm)
             iter_time_meter.update(iter_elapsed_time_ms)
             gpu_time_meter.update(gpu_etime_ms)
             data_elapsed_time_meter.update(data_elapsed_time_ms)
@@ -825,6 +856,7 @@ def main(args, resume_preempt=False):
                     epoch + 1,
                     itr,
                     loss,
+                    grad_norm,
                     iter_elapsed_time_ms,
                     gpu_etime_ms,
                     data_elapsed_time_ms,
@@ -836,7 +868,8 @@ def main(args, resume_preempt=False):
                     or np.isinf(loss)
                 ):
                     logger.info(
-                        "[%d, %5d] loss: %.3f "
+                        "[%d, %5d] loss: %.3f (cur: %.3f max: %.3f) "
+                        "grad_norm: %.3e (avg: %.3e max: %.3e) "
                         "masks: %s "
                         "[wd: %.2e] [lr: %.2e] "
                         "[mem: %.2e] "
@@ -847,6 +880,11 @@ def main(args, resume_preempt=False):
                             epoch + 1,
                             itr,
                             loss_meter.avg,
+                            loss_meter.val,
+                            loss_meter.max,
+                            grad_norm,
+                            grad_norm_meter.avg,
+                            grad_norm_meter.max,
                             "["
                             + ", ".join(
                                 [

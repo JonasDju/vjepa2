@@ -12,6 +12,7 @@ dependencies = [
     "h5py>=3.16.0",
     "iopath>=0.1.10",
     "jupyter>=1.1.1",
+    "kneeno",
     "numpy>=2.5.2",
     "opencv-python>=5.0.0.93",
     "pandas>=3.0.5",
@@ -38,3 +39,6 @@ line_length=119
 
 [tool.black]
 line-length = 119
+
+[tool.uv.sources]
+kneeno = { path = "../KneeNo", editable = true }

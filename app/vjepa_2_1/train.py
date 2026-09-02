@@ -107,6 +107,9 @@ def main(args, resume_preempt=False):
     else:
         dtype = torch.float32
         mixed_precision = False
+    # bfloat16 has the same dynamic range as float32, so it does not need gradient
+    # loss-scaling -- only float16 uses a GradScaler.
+    use_grad_scaler = which_dtype.lower() == "float16"
 
     # -- MASK
     cfgs_mask = args.get("mask")
@@ -494,7 +497,7 @@ def main(args, resume_preempt=False):
         warmup=warmup,
         num_epochs=num_epochs,
         ipe_scale=ipe_scale,
-        mixed_precision=mixed_precision,
+        use_grad_scaler=use_grad_scaler,
         betas=betas,
         eps=eps,
     )
@@ -785,7 +788,7 @@ def main(args, resume_preempt=False):
 
                 grad_norm = float("nan")
                 if run_step:
-                    if mixed_precision:
+                    if scaler is not None:
                         scaler.scale(loss).backward()
                         scaler.unscale_(optimizer)
                     else:
@@ -795,7 +798,7 @@ def main(args, resume_preempt=False):
                     grad_norm = compute_grad_norm(
                         list(encoder.parameters()) + list(predictor.parameters())
                     )
-                    if mixed_precision:
+                    if scaler is not None:
                         scaler.step(optimizer)
                         scaler.update()
                     else:

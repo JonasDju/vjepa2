@@ -106,12 +106,13 @@ optimization:
   epochs: 200
   # lr scaled down for single-GPU global batch 48; upstream lr 6e-4 targets the
   # ~3072 global batch of the 64-GPU pretrain config. final_lr == lr (WSD: the decay
-  # phase lives in the separate cooldown config).
-  final_lr: 0.0001
+  # phase lives in the separate cooldown config). Dropped 1e-4 -> 5e-5 after the
+  # 1e-4 run still diverged to NaN at epoch 64.
+  final_lr: 0.00005
   final_weight_decay: 0.04
   ipe: 300
   ipe_scale: 1.25
-  lr: 0.0001
-  start_lr: 0.00002
+  lr: 0.00005
+  start_lr: 0.00001
   warmup: 40
   weight_decay: 0.04

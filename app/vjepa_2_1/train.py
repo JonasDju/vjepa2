@@ -56,6 +56,9 @@ torch.backends.cudnn.benchmark = True
 
 logger = get_logger(__name__, force=True)
 
+NORMALIZE_RGB = ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+NORMALIZE_MI = ((0.5,), (0.5,))
+
 
 def main(args, resume_preempt=False):
     # ----------------------------------------------------------------------- #
@@ -137,7 +140,8 @@ def main(args, resume_preempt=False):
     elif model_name == "vit_gigantic_xformers":
         embed_dim_encoder = 1664
     else:
-        print("Model name not recognized :(")
+        raise ValueError("Model name not recognized :(")
+
 
     # -- DATA
     cfgs_data = args.get("data")
@@ -417,9 +421,9 @@ def main(args, resume_preempt=False):
 
     if is_mi_dataset:
         # single-channel grayscale volumes -> single-value normalize (~maps [0, 255] to [-1, 1])
-        normalize = ((0.5,), (0.5,))
+        normalize = NORMALIZE_MI
     else:
-        normalize = ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+        normalize = NORMALIZE_RGB
     transform = make_transforms(
         random_horizontal_flip=True,
         random_resize_aspect_ratio=ar_range,
@@ -549,13 +553,13 @@ def main(args, resume_preempt=False):
         except Exception as e:
             logger.info(f"Encountered exception when saving checkpoint: {e}")
 
-    # -- KneeNo classification evaluation (frozen encoder, run every eval.freq.<task> epochs)
+    # KneeNo classification evaluation (frozen encoder, run every eval.freq.<task> epochs)
     evaluator = None
     if cfgs_eval is not None:
         eval_adapter = VJepa21Adapter(
             embed_dim=embed_dim_encoder,
             crop_size=crop_size,
-            normalize=((0.5,), (0.5,)) if is_mi_dataset else ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+            normalize=normalize,
         )
         evaluator = ClassificationEvaluator(
             config=cfgs_eval,
@@ -901,12 +905,12 @@ def main(args, resume_preempt=False):
                 save_every_path = os.path.join(folder, save_every_file)
                 save_checkpoint(epoch + 1, save_every_path)
 
-        # -- KneeNo classification evaluation (frozen encoder). One TensorBoard
+        # KneeNo classification evaluation (frozen encoder). One TensorBoard
         # point per embedding-model epoch (log_every_head_epoch=False) so e.g.
         # the knn and linear_pool curves stay aligned even though knn has no
         # head-training epochs and linear_pool has several. Called on every
-        # rank -- ClassificationEvaluator itself only does work on rank 0 and
-        # broadcasts the result, so this is safe under DDP.
+        # rank, but ClassificationEvaluator itself only does work on rank 0 and
+        # broadcasts the result -> safe under DDP.
         if evaluator is not None:
             due_tasks = tasks_due(epoch, evaluator.config["freq"])
             if due_tasks:

@@ -28,6 +28,7 @@ import pprint
 import torch
 import yaml
 from app.vjepa_2_1.utils import init_video_model
+from app.vjepa_2_1.train import NORMALIZE_MI, NORMALIZE_RGB
 from kneeno.evaluation import ClassificationEvaluator
 from src.datasets.kneeno_adapter import VJepa21Adapter
 from src.utils.checkpoint_loader import robust_checkpoint_loader
@@ -36,7 +37,7 @@ from src.utils.logging import get_logger
 
 logger = get_logger(__name__, force=True)
 
-# eval.encoder / --encoder value -> key in the checkpoint dict written by save_checkpoint()
+# maps yaml eval.encoder / --encoder argument -> key in the checkpoint dict written by save_checkpoint()
 ENCODER_STATE_DICT_KEYS = {"target": "target_encoder", "online": "encoder"}
 
 
@@ -56,9 +57,9 @@ def parse_args():
         type=str,
         nargs="+",
         default=None,
-        choices=["knn", "linear", "linear_pool", "attentive_pool"],
-        help="subset of tasks to run; defaults to all four (note: 'linear' is unavailable for "
-        "V-JEPA 2.1 -- it has no cls token, see VJepa21Adapter)",
+        choices=["knn", "linear_pool", "attentive_pool"],
+        help="subset of tasks to run; defaults to all four (note: 'linear' unavailable, use "
+        "linear_pool instead)",
     )
     parser.add_argument("--device", type=str, default="cpu", help="e.g. 'cpu' or 'cuda:0'")
     return parser.parse_args()
@@ -122,7 +123,7 @@ def main():
 
     cfgs_eval = config.get("eval")
     if cfgs_eval is None:
-        raise ValueError(f"{args.fname} has no 'eval:' block -- nothing to evaluate against")
+        raise ValueError(f"{args.fname} has no 'eval:' block")
 
     cfgs_model = config["model"]
     cfgs_data = config["data"]
@@ -147,7 +148,7 @@ def main():
     adapter = VJepa21Adapter(
         embed_dim=encoder.embed_dim,
         crop_size=cfgs_data.get("crop_size", 224),
-        normalize=((0.5,), (0.5,)) if is_mi_dataset else ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+        normalize=NORMALIZE_MI if is_mi_dataset else NORMALIZE_RGB,
     )
 
     evaluator = ClassificationEvaluator(config=cfgs_eval, adapter=adapter, device=device)
@@ -155,8 +156,7 @@ def main():
         metrics = evaluator.evaluate(encoder, tasks=args.tasks, epoch=0, log_every_head_epoch=True)
     finally:
         # Flush+close the TensorBoard writer so buffered scalars are not lost
-        # if the process exits right after (SummaryWriter's flush_secs default
-        # is 120s -- do not rely on it here).
+        # if the process exits right after
         evaluator.tb.close()
 
     logger.info("final metrics: %s", metrics)

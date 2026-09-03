@@ -63,7 +63,6 @@ mask:
   - 1.0
 meta:
   dtype: bfloat16
-  eval_freq: 100
   load_checkpoint: true
   read_checkpoint: null
   save_every_freq: 50
@@ -115,3 +114,49 @@ optimization:
   start_lr: 0.00002
   warmup: 40
   weight_decay: 0.04
+
+# KneeNo classification evaluation, run on the frozen (target) encoder every
+# eval.freq.<task> epochs -- see KneeNo/kneeno/evaluation/config.py for every
+# key. "linear" is explicitly disabled below: V-JEPA 2.1 has no cls token
+# (VJepa21Adapter.has_cls_token = False), so selecting it would raise.
+eval:
+  seed: 239
+  encoder: target  # target (EMA) | online
+  split:
+    test_fraction: 0.2
+  data:
+    # TODO: point at the real labeled classification dataset once it exists
+    # (see KneeNo/kneeno/evaluation/dataset.py -- LabeledKneeMRIDataset is a
+    # temporary stub until then).
+    data_root: /dev/shm/kneeno_data
+    label_meta: /hpcwork/p0021834/workspace_roman/jonas/BigKneeTar/labels.json
+    series_depth: 0  # match the series_depth above -- no resampling distribution shift
+    resample_mode: nearest
+    batch_size: 16
+    num_workers: 8
+  logging:
+    tensorboard_dir: /hpcwork/va105917/vjepa/pretrain_2_1/16.8.vitb.256px.16f/eval_tb
+    tag_prefix: eval
+  freq:
+    knn: 1
+    linear: null  # V-JEPA 2.1 has no cls token -- explicitly override the default's freq (omitting
+                  # this key would leave the default "linear: 5" in place via the config merge)
+    linear_pool: 5
+    attentive_pool: 5
+  knn:
+    k: [5, 20]
+    metric: cosine
+    temperature: 0.07
+    pooling: avg
+  linear_pool:
+    pooling: avg
+    epochs: 20
+    batch_size: 64
+    lr: 0.001
+  attentive_pool:
+    depth: 1
+    num_heads: 12
+    epochs: 20
+    batch_size: 32
+    lr: 0.0005
+    warmup_epochs: 5

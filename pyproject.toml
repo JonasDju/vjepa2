@@ -26,6 +26,7 @@ dependencies = [
     "tensorboard>=2.21.0",
     "timm>=1.0.29",
     "torch>=2",
+    "torchmetrics>=1.0",
     "torchvision>=0.28.0",
     "transformers>=5.16.1",
     "wandb>=0.29.0",

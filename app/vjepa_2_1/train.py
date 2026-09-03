@@ -30,7 +30,9 @@ from app.vjepa_2_1.utils import (
     load_checkpoint,
     normalize_nested,
 )
+from kneeno.evaluation import ClassificationEvaluator, tasks_due
 from src.datasets.data_manager import init_data
+from src.datasets.kneeno_adapter import VJepa21Adapter
 from src.masks.multiseq_multiblock3d import MaskCollator
 from src.masks.utils import apply_masks
 from src.utils.config import expand_env_vars
@@ -230,6 +232,10 @@ def main(args, resume_preempt=False):
     loss_reg_min_epoch = cfgs_opt.get("loss_reg_min_epoch", 50)
     if loss_reg_std_mult is not None:
         logger.info("Loss regulation activated")
+
+    # -- EVAL (KneeNo classification evaluation, run periodically during pretraining)
+    # Absent "eval:" block -> evaluation is skipped entirely.
+    cfgs_eval = args.get("eval")
     # ----------------------------------------------------------------------- #
 
     np.random.seed(seed)
@@ -542,6 +548,22 @@ def main(args, resume_preempt=False):
             torch.save(save_dict, path)
         except Exception as e:
             logger.info(f"Encountered exception when saving checkpoint: {e}")
+
+    # -- KneeNo classification evaluation (frozen encoder, run every eval.freq.<task> epochs)
+    evaluator = None
+    if cfgs_eval is not None:
+        eval_adapter = VJepa21Adapter(
+            embed_dim=embed_dim_encoder,
+            crop_size=crop_size,
+            normalize=((0.5,), (0.5,)) if is_mi_dataset else ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+        )
+        evaluator = ClassificationEvaluator(
+            config=cfgs_eval,
+            adapter=eval_adapter,
+            device=device,
+            rank=rank,
+            world_size=world_size,
+        )
 
     logger.info("Initializing loader...")
     unsupervised_sampler.set_epoch(start_epoch)
@@ -878,3 +900,21 @@ def main(args, resume_preempt=False):
                 save_every_file = f"e{epoch}.pth.tar"
                 save_every_path = os.path.join(folder, save_every_file)
                 save_checkpoint(epoch + 1, save_every_path)
+
+        # -- KneeNo classification evaluation (frozen encoder). One TensorBoard
+        # point per embedding-model epoch (log_every_head_epoch=False) so e.g.
+        # the knn and linear_pool curves stay aligned even though knn has no
+        # head-training epochs and linear_pool has several. Called on every
+        # rank -- ClassificationEvaluator itself only does work on rank 0 and
+        # broadcasts the result, so this is safe under DDP.
+        if evaluator is not None:
+            due_tasks = tasks_due(epoch, evaluator.config["freq"])
+            if due_tasks:
+                eval_encoder = target_encoder if evaluator.config.get("encoder", "target") == "target" else encoder
+                eval_metrics = evaluator.evaluate(
+                    eval_encoder, tasks=due_tasks, epoch=epoch, log_every_head_epoch=False
+                )
+                logger.info(f"[epoch {epoch + 1}] eval ({due_tasks}): {eval_metrics}")
+
+    if evaluator is not None:
+        evaluator.tb.close()

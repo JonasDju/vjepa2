@@ -46,6 +46,14 @@ CHECKPOINT_FREQ = 1
 GARBAGE_COLLECT_ITR_FREQ = 50
 MAX_REPEAT_COUNTS = 10
 
+# -- Non-finite-gradient guard (diagnostics + resilience). When an iteration's gradients
+#    are inf/nan we skip the optimizer step and the target EMA update for that iteration
+#    -- exactly what torch.cuda.amp.GradScaler.step() did for us before the bf16 scaler
+#    was removed (commit ddf38d3) -- and dump forensics instead of crashing. The job
+#    still hard-fails if it never recovers.
+MAX_CONSECUTIVE_NONFINITE = 25
+FORENSIC_SAVE_LIMIT = 3
+
 
 def compute_grad_norm(parameters, norm_type=2.0):
     """Global gradient norm over ``parameters`` -- diagnostics only.
@@ -182,6 +190,22 @@ def _module_l2_distance(m1, m2):
         if not diffs:
             return float("nan")
         return float(torch.norm(torch.stack(diffs)))
+
+
+def _grad_layer_report(named_parameters, topk=12):
+    """Localise a backward blow-up. Returns a list of ``(name, grad_norm, n_nonfinite)``:
+    every parameter whose ``.grad`` holds a non-finite value (``n_nonfinite`` > 0) first,
+    then the ``topk`` finite-grad parameters with the largest grad norm. Read-only."""
+    bad, good = [], []
+    for name, p in named_parameters:
+        if p.grad is None:
+            continue
+        g = p.grad.detach().float()
+        gn = float(torch.norm(g))
+        n_nf = int((~torch.isfinite(g)).sum())
+        (bad if n_nf else good).append((name, gn, n_nf))
+    good.sort(key=lambda x: x[1], reverse=True)
+    return bad + good[:topk]
 
 
 _GLOBAL_SEED = 0
@@ -501,6 +525,8 @@ def main(args, resume_preempt=False):
         ("%.4e", "zpred-rms"),
         ("%.4e", "h-rms"),
         ("%.4e", "h-token-std"),
+        ("%d", "step-skipped"),
+        ("%.4e", "d-min"),
         ("%d", "iter-time(ms)"),
         ("%d", "gpu-time(ms)"),
         ("%d", "dataload-time(ms)"),
@@ -691,6 +717,103 @@ def main(args, resume_preempt=False):
         except Exception as e:
             logger.info(f"Encountered exception when saving checkpoint: {e}")
 
+    def _dump_forensics(fx, cur_epoch, *, save_heavy, save_checkpoint_now):
+        """Log everything captured about a non-finite iteration and, when asked, persist
+        the offending batch, its masks and (once) a full checkpoint for offline repro.
+        Best-effort -- never raises. Returns True iff a batch/mask bundle was written.
+
+        ``fx`` is the ``forensics`` dict from ``train_step`` (``None`` if neither the
+        forward nor the gradients were captured as non-finite, i.e. the value appeared
+        only in the optimizer/EMA state)."""
+        trigger = fx.get("trigger", "unknown") if fx else "none"
+        ep = fx.get("epoch") if fx else cur_epoch
+        it = fx.get("itr") if fx else None
+        tag = f"e{ep}_i{it}" if it is not None else f"e{ep}"
+        logger.error(
+            "[forensics/%s] epoch=%s itr=%s loss=%s loss_pred=%s loss_context=%s d_min=%s",
+            trigger,
+            ep,
+            it,
+            fx.get("loss") if fx else None,
+            fx.get("loss_pred") if fx else None,
+            fx.get("loss_context") if fx else None,
+            fx.get("d_min") if fx else None,
+        )
+        if fx is None:
+            logger.error(
+                "[forensics] no per-step capture -- forward and gradients were finite; "
+                "the non-finite value appeared later (optimizer state / EMA update)."
+            )
+        elif trigger == "nonfinite-forward":
+            logger.error(
+                "[forensics] first non-finite tensor in forward: %s",
+                fx.get("first_nonfinite"),
+            )
+        elif trigger == "nonfinite-grad":
+            logger.error(
+                "[forensics] grad_norm=%s (enc=%s pred=%s masktok=%s)",
+                fx.get("grad_norm"),
+                fx.get("grad_norm_enc"),
+                fx.get("grad_norm_pred"),
+                fx.get("grad_norm_masktok"),
+            )
+            for who, rep in (
+                ("encoder", fx.get("enc_layers")),
+                ("predictor", fx.get("pred_layers")),
+            ):
+                for name, gn, n_nf in rep or []:
+                    logger.error(
+                        "[forensics]   %s.%s grad_norm=%.3e non_finite=%d",
+                        who,
+                        name,
+                        gn,
+                        n_nf,
+                    )
+        for i, s in enumerate(fx.get("clip_stats", []) if fx else []):
+            logger.error("[forensics] input clip[%d] %s", i, s)
+        logger.error("[forensics] last %d iterations:", len(recent_iters))
+        for row in recent_iters:
+            logger.error("[forensics]   %s", row)
+
+        wrote_bundle = False
+        try:
+            enc_pn, enc_pmax = _param_norm_stats(encoder)
+            prd_pn, prd_pmax = _param_norm_stats(predictor)
+            eas_min, eas_max, eas_nf = _adam_state_stats(optimizer)
+            tgt_dist = _module_l2_distance(encoder, target_encoder)
+            logger.error(
+                "[forensics] param-norm enc=%.3e (max|w| %.3e) pred=%.3e (max|w| %.3e) "
+                "adam exp_avg_sq[min=%.3e max=%.3e nonfinite=%d] online<->target L2=%.3e",
+                enc_pn,
+                enc_pmax,
+                prd_pn,
+                prd_pmax,
+                eas_min,
+                eas_max,
+                eas_nf,
+                tgt_dist,
+            )
+            if save_heavy and fx is not None and "clips_cpu" in fx:
+                bpath = os.path.join(folder, f"nan_batch_{tag}.pt")
+                torch.save(fx["clips_cpu"], bpath)
+                mpath = os.path.join(folder, f"nan_masks_{tag}.pt")
+                torch.save(
+                    {
+                        "masks_enc": fx.get("masks_enc_cpu"),
+                        "masks_pred": fx.get("masks_pred_cpu"),
+                    },
+                    mpath,
+                )
+                logger.error("[forensics] wrote %s and %s", bpath, mpath)
+                wrote_bundle = True
+            if save_checkpoint_now:
+                cpath = os.path.join(folder, f"nan_debug_{tag}.pth.tar")
+                save_checkpoint(ep, cpath)
+                logger.error("[forensics] wrote %s", cpath)
+        except Exception as e:  # noqa: BLE001 -- best-effort forensics
+            logger.error("[forensics] failed to save debug artifacts: %s", e)
+        return wrote_bundle
+
     logger.info("Initializing loader...")
     unsupervised_sampler.set_epoch(start_epoch)
     loader = iter(unsupervised_loader)
@@ -718,6 +841,10 @@ def main(args, resume_preempt=False):
     #    loss so the ramp into the blow-up is visible even between log_freq lines.
     recent_iters = deque(maxlen=40)
     last_ema_m = float("nan")
+    # -- non-finite-gradient guard: consecutive skipped iterations, and how many heavy
+    #    forensic bundles we have written so far this run.
+    consecutive_nonfinite = 0
+    forensic_saves = 0
 
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
@@ -725,6 +852,7 @@ def main(args, resume_preempt=False):
 
         loss_meter = AverageMeter()
         grad_norm_meter = AverageMeter()
+        epoch_skips = 0  # iterations this epoch the non-finite-grad guard skipped
         mask_meters = {fpc: AverageMeter() for fpc in dataset_fpcs}
         iter_time_meter = AverageMeter()
         gpu_time_meter = AverageMeter()
@@ -875,6 +1003,7 @@ def main(args, resume_preempt=False):
 
                 # Step 1. Forward
                 loss_context = None
+                d_min = float("nan")
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
                     h = forward_target(clips)
                     z_pred, z_context = forward_context(clips)
@@ -888,6 +1017,15 @@ def main(args, resume_preempt=False):
                     if predict_all:
                         distance_weights = compute_mask_distance(
                             masks_pred, masks_enc, grid_size, offset_context_loss
+                        )
+                        # -- diagnostics only: the smallest d_ij that the context loss
+                        #    will invert as 1/d_ij. A near-zero value inflates that
+                        #    term's gradient while staying invisible in the mean forward
+                        #    loss. Observed here, never clamped (that would change the
+                        #    upstream objective).
+                        d_min = min(
+                            (float(t.min()) for t in _iter_tensors(distance_weights)),
+                            default=float("nan"),
                         )
                         if weight_distance_loss:
                             d_weights = distance_weights
@@ -930,14 +1068,22 @@ def main(args, resume_preempt=False):
                         ]
                     )
                     forensics = {
+                        "trigger": "nonfinite-forward",
                         "epoch": epoch + 1,
                         "itr": itr,
                         "first_nonfinite": first_bad,
+                        "d_min": d_min,
                         "loss": loss_v,
                         "loss_pred": loss_pred_v,
                         "loss_context": loss_context_v,
                         "clip_stats": [_tensor_stats(c) for c in clips],
                         "clips_cpu": [c.detach().to("cpu") for c in clips],
+                        "masks_enc_cpu": [
+                            [m.detach().to("cpu") for m in mm] for mm in masks_enc
+                        ],
+                        "masks_pred_cpu": [
+                            [m.detach().to("cpu") for m in mm] for mm in masks_pred
+                        ],
                     }
 
                 # Step 2. Backward & step
@@ -962,6 +1108,7 @@ def main(args, resume_preempt=False):
                 grad_norm_enc = float("nan")
                 grad_norm_pred = float("nan")
                 grad_norm_masktok = float("nan")
+                grads_finite = True
                 if run_step:
                     if scaler is not None:
                         scaler.scale(loss).backward()
@@ -978,25 +1125,69 @@ def main(args, resume_preempt=False):
                     grad_norm_masktok = compute_grad_norm(
                         [p for n, p in predictor.named_parameters() if "mask_token" in n]
                     )
-                    if scaler is not None:
-                        scaler.step(optimizer)
+
+                    # -- Non-finite-gradient guard: skip the optimizer step (and the
+                    #    target EMA update below) for this iteration, exactly as
+                    #    torch.cuda.amp.GradScaler.step() did before the bf16 scaler was
+                    #    removed (commit ddf38d3). No gradient is clipped or rescaled;
+                    #    optimizer.zero_grad() still runs so the bad grads don't linger.
+                    grads_finite = bool(np.isfinite(grad_norm))
+                    if not grads_finite and forensics is None:
+                        forensics = {
+                            "trigger": "nonfinite-grad",
+                            "epoch": epoch + 1,
+                            "itr": itr,
+                            "d_min": d_min,
+                            "loss": loss_v,
+                            "loss_pred": loss_pred_v,
+                            "loss_context": loss_context_v,
+                            "grad_norm": grad_norm,
+                            "grad_norm_enc": grad_norm_enc,
+                            "grad_norm_pred": grad_norm_pred,
+                            "grad_norm_masktok": grad_norm_masktok,
+                            "enc_layers": _grad_layer_report(encoder.named_parameters()),
+                            "pred_layers": _grad_layer_report(
+                                predictor.named_parameters()
+                            ),
+                            "clip_stats": [_tensor_stats(c) for c in clips],
+                            "clips_cpu": [c.detach().to("cpu") for c in clips],
+                            "masks_enc_cpu": [
+                                [m.detach().to("cpu") for m in mm] for mm in masks_enc
+                            ],
+                            "masks_pred_cpu": [
+                                [m.detach().to("cpu") for m in mm] for mm in masks_pred
+                            ],
+                        }
+
+                    if grads_finite:
+                        if scaler is not None:
+                            scaler.step(optimizer)
+                            scaler.update()
+                        else:
+                            optimizer.step()
+                    elif scaler is not None:
+                        # let the scaler back off its scale, as scaler.step() would have
                         scaler.update()
-                    else:
-                        optimizer.step()
                 optimizer.zero_grad()
 
-                # Step 3. momentum update of target encoder
+                # Step 3. momentum update of target encoder. Advance the schedule every
+                # iteration (keeps it aligned to the step count) but only apply the
+                # update when the optimizer actually stepped -- a skipped step leaves the
+                # online weights unchanged, and we do not want the target tracking an
+                # iteration the guard rejected.
                 m = min(next(momentum_scheduler), ema[1])
-                with torch.no_grad():
-                    params_k = []
-                    params_q = []
-                    for param_q, param_k in zip(
-                        encoder.parameters(), target_encoder.parameters()
-                    ):
-                        params_k.append(param_k)
-                        params_q.append(param_q)
-                    torch._foreach_mul_(params_k, m)
-                    torch._foreach_add_(params_k, params_q, alpha=1 - m)
+                step_applied = run_step and grads_finite
+                if step_applied:
+                    with torch.no_grad():
+                        params_k = []
+                        params_q = []
+                        for param_q, param_k in zip(
+                            encoder.parameters(), target_encoder.parameters()
+                        ):
+                            params_k.append(param_k)
+                            params_q.append(param_q)
+                        torch._foreach_mul_(params_k, m)
+                        torch._foreach_add_(params_k, params_q, alpha=1 - m)
 
                 return {
                     "loss": loss_v,
@@ -1013,6 +1204,9 @@ def main(args, resume_preempt=False):
                     "h_rms": h_rms,
                     "h_token_std": h_token_std,
                     "ema_m": float(m),
+                    "d_min": d_min,
+                    "grads_finite": grads_finite,
+                    "step_applied": step_applied,
                     "forensics": forensics,
                 }
 
@@ -1028,9 +1222,31 @@ def main(args, resume_preempt=False):
             if np.isfinite(grad_norm):
                 grad_norm_meter.update(grad_norm)
 
+            # -- non-finite-gradient guard book-keeping: abort only if the run cannot
+            #    recover (many skips in a row); a lone skip is expected to be survivable.
+            if step_out["grads_finite"]:
+                consecutive_nonfinite = 0
+            else:
+                consecutive_nonfinite += 1
+                epoch_skips += 1
+                logger.warning(
+                    "[nonfinite-grad] epoch %d itr %d: grad_norm=%s -- skipped the "
+                    "optimizer step + EMA update (%d in a row)",
+                    epoch + 1,
+                    itr,
+                    step_out["grad_norm"],
+                    consecutive_nonfinite,
+                )
+                if consecutive_nonfinite > MAX_CONSECUTIVE_NONFINITE:
+                    raise RuntimeError(
+                        f"{consecutive_nonfinite} consecutive non-finite-gradient "
+                        f"iterations (last at epoch {epoch + 1} itr {itr}); aborting."
+                    )
+
             recent_iters.append(
                 "e%d i%d loss=%.4f (pred=%.4f ctx=%.4f) gnorm=%.3e "
-                "(enc=%.3e pred=%.3e mtok=%.3e) zpred_rms=%.3e h_rms=%.3e h_tstd=%.3e"
+                "(enc=%.3e pred=%.3e mtok=%.3e) zpred_rms=%.3e h_rms=%.3e h_tstd=%.3e "
+                "d_min=%.3e%s"
                 % (
                     epoch + 1,
                     itr,
@@ -1044,6 +1260,8 @@ def main(args, resume_preempt=False):
                     step_out["zpred_rms"],
                     step_out["h_rms"],
                     step_out["h_token_std"],
+                    step_out["d_min"],
+                    "" if step_out["step_applied"] else " STEP-SKIPPED",
                 )
             )
             iter_time_meter.update(iter_elapsed_time_ms)
@@ -1077,6 +1295,8 @@ def main(args, resume_preempt=False):
                     step_out["zpred_rms"],
                     step_out["h_rms"],
                     step_out["h_token_std"],
+                    0 if step_out["step_applied"] else 1,
+                    step_out["d_min"],
                     iter_elapsed_time_ms,
                     gpu_etime_ms,
                     data_elapsed_time_ms,
@@ -1093,6 +1313,7 @@ def main(args, resume_preempt=False):
                         "grad_norm: %.3e (avg: %.3e max: %.3e) "
                         "[enc: %.3e pred: %.3e mtok: %.3e] "
                         "repr[zpred_rms: %.3e h_rms: %.3e h_tstd: %.3e] "
+                        "[d_min: %.3e]%s "
                         "masks: %s "
                         "[wd: %.2e] [lr: %.2e] "
                         "[mem: %.2e] "
@@ -1116,6 +1337,8 @@ def main(args, resume_preempt=False):
                             step_out["zpred_rms"],
                             step_out["h_rms"],
                             step_out["h_token_std"],
+                            step_out["d_min"],
+                            "" if step_out["step_applied"] else " STEP-SKIPPED",
                             "["
                             + ", ".join(
                                 [
@@ -1135,57 +1358,25 @@ def main(args, resume_preempt=False):
 
             log_stats()
 
-            # -- diagnostics: on a non-finite loss, dump everything we have before the
-            #    assert kills the job -- the offending forward, the ramp of the last
-            #    iterations, and a checkpoint + the batch tensor for offline repro.
-            if not np.isfinite(loss):
-                logger.error(
-                    "[NaN] non-finite loss=%s at epoch %d itr %d", loss, epoch + 1, itr
-                )
-                fx = step_out.get("forensics")
-                if fx is not None:
-                    logger.error(
-                        "[NaN] first non-finite in forward: %s "
-                        "(loss_pred=%s loss_context=%s)",
-                        fx["first_nonfinite"],
-                        fx["loss_pred"],
-                        fx["loss_context"],
-                    )
-                    for i, s in enumerate(fx["clip_stats"]):
-                        logger.error("[NaN] input clip[%d] %s", i, s)
-                else:
-                    logger.error(
-                        "[NaN] forward was finite -- loss went non-finite in "
-                        "backward/optimizer step or the target EMA update"
-                    )
-                logger.error("[NaN] last %d iterations:", len(recent_iters))
-                for row in recent_iters:
-                    logger.error("[NaN]   %s", row)
-                try:
-                    enc_pn, enc_pmax = _param_norm_stats(encoder)
-                    prd_pn, prd_pmax = _param_norm_stats(predictor)
-                    eas_min, eas_max, eas_nf = _adam_state_stats(optimizer)
-                    logger.error(
-                        "[NaN] param-norm enc=%.3e (max|w| %.3e) pred=%.3e (max|w| %.3e) "
-                        "adam exp_avg_sq[min=%.3e max=%.3e nonfinite=%d]",
-                        enc_pn,
-                        enc_pmax,
-                        prd_pn,
-                        prd_pmax,
-                        eas_min,
-                        eas_max,
-                        eas_nf,
-                    )
-                    save_checkpoint(epoch + 1, os.path.join(folder, "nan_debug.pth.tar"))
-                    if fx is not None and "clips_cpu" in fx:
-                        torch.save(
-                            fx["clips_cpu"], os.path.join(folder, "nan_batch.pt")
-                        )
-                    logger.error(
-                        "[NaN] wrote %s/nan_debug.pth.tar and nan_batch.pt", folder
-                    )
-                except Exception as e:  # noqa: BLE001 -- best-effort forensics
-                    logger.error("[NaN] failed to save debug artifacts: %s", e)
+            # -- diagnostics: whenever the forward or the gradients were captured as
+            #    non-finite (guard already skipped the step), or the loss itself went
+            #    non-finite, dump the ramp + localise the blow-up. Heavy artifacts
+            #    (batch, masks) for the first FORENSIC_SAVE_LIMIT hits; one checkpoint.
+            #    A NaN loss trips the assert just below (terminal, one iteration) so it
+            #    always gets the full dump; an inf loss does NOT trip the assert, so its
+            #    heavy saves stay under the cap to bound disk use if it repeats.
+            fx = step_out.get("forensics")
+            loss_is_nan = bool(np.isnan(loss))
+            if fx is not None or not np.isfinite(loss):
+                save_heavy = forensic_saves < FORENSIC_SAVE_LIMIT or loss_is_nan
+                save_ckpt = forensic_saves == 0 or loss_is_nan
+                if _dump_forensics(
+                    fx,
+                    epoch + 1,
+                    save_heavy=save_heavy,
+                    save_checkpoint_now=save_ckpt,
+                ):
+                    forensic_saves += 1
 
             assert not np.isnan(loss), "loss is nan"
 
@@ -1198,7 +1389,8 @@ def main(args, resume_preempt=False):
         logger.info(
             "[epoch %d summary] param-norm enc=%.3e (max|w| %.3e) "
             "pred=%.3e (max|w| %.3e) adam exp_avg_sq[min=%.3e max=%.3e nonfinite=%d] "
-            "online<->target L2=%.3e ema_m=%.5f grad_norm(avg=%.3e max=%.3e)"
+            "online<->target L2=%.3e ema_m=%.5f grad_norm(avg=%.3e max=%.3e) "
+            "guard-skipped=%d"
             % (
                 epoch + 1,
                 enc_pnorm,
@@ -1212,6 +1404,7 @@ def main(args, resume_preempt=False):
                 last_ema_m,
                 grad_norm_meter.avg,
                 grad_norm_meter.max,
+                epoch_skips,
             )
         )
         if (epoch + 1) % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1):

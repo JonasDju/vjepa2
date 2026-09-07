@@ -55,6 +55,7 @@ class VisionTransformerPredictor(nn.Module):
         modality_embedding=True,
         img_temporal_dim_size=None,
         teacher_embed_dim=None,
+        use_qk_norm=False,
         **kwargs
     ):
         super().__init__()
@@ -163,6 +164,7 @@ class VisionTransformerPredictor(nn.Module):
                     has_cls_first=has_cls_first,
                     interpolate_rope=interpolate_rope,
                     patch_size=patch_size,
+                    use_qk_norm=use_qk_norm,
                 )
                 for i in range(depth)
             ]

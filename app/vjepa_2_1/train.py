@@ -284,6 +284,9 @@ def main(args, resume_preempt=False):
     lambda_value_vid = cfgs_model.get("lambda_value_vid", 0.0)
     n_registers_predictor = cfgs_model.get("n_registers_predictor", 0)
     lambda_progressive = cfgs_model.get("lambda_progressive", True)
+    lambda_warmup_start_iter = cfgs_model.get("lambda_warmup_start_iter", 15000)
+    lambda_warmup_end_iter = cfgs_model.get("lambda_warmup_end_iter", 30000)
+    use_qk_norm = cfgs_model.get("use_qk_norm", False)
     normalize_predictor = cfgs_model.get("normalize_predictor", False)
     modality_embedding = cfgs_model.get("modality_embedding", False)
     levels_predictor = cfgs_model.get("levels_predictor", 4)
@@ -555,6 +558,7 @@ def main(args, resume_preempt=False):
         use_pred_silu=use_pred_silu,
         wide_silu=wide_silu,
         use_rope=use_rope,
+        use_qk_norm=use_qk_norm,
         use_activation_checkpointing=use_activation_checkpointing,
         return_all_tokens=predict_all,
         chop_last_n_tokens=shift_by_n,
@@ -668,7 +672,15 @@ def main(args, resume_preempt=False):
         ema[0] + i * (ema[1] - ema[0]) / (ipe * num_epochs * ipe_scale)
         for i in range(int(ipe * num_epochs) + 1)
     )
-    lambda_sched = Lambda_LinearWarmupHold(lambda_value=lambda_value)
+    lambda_sched = Lambda_LinearWarmupHold(
+        lambda_value=lambda_value,
+        start_iter=lambda_warmup_start_iter,
+        end_iter=lambda_warmup_end_iter,
+    )
+    logger.info(
+        f"context-loss lambda warmup: 0 -> {lambda_value} over global iters "
+        f"[{lambda_warmup_start_iter}, {lambda_warmup_end_iter}]"
+    )
 
     start_epoch = 0
     # -- load training checkpoint

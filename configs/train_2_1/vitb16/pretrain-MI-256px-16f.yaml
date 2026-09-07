@@ -76,6 +76,13 @@ model:
   is_causal: false
   lambda_value_img: 0.5
   lambda_value_vid: 0.5
+  lambda_progressive: true
+  lambda_warmup_start_iter: 15000
+  lambda_warmup_end_iter: 30000
+  # -- ViT-22B QK-normalization in every encoder + predictor attention block.
+  #    false = upstream behaviour (no QK-norm). See the block-0 head-5 QK-logit
+  #    runaway in nan-loss analysis; flip to true to arrest it.
+  use_qk_norm: false
   local_window:
   - -1
   - -1

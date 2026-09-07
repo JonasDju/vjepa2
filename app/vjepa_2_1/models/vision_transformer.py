@@ -54,6 +54,7 @@ class VisionTransformer(nn.Module):
         interpolate_rope=False,
         modality_embedding=True,
         n_output_distillation=4,
+        use_qk_norm=False,
         **kwargs,
     ):
         super().__init__()
@@ -134,6 +135,7 @@ class VisionTransformer(nn.Module):
                     has_cls_first=has_cls_first,
                     interpolate_rope=interpolate_rope,
                     patch_size=patch_size,
+                    use_qk_norm=use_qk_norm,
                 )
                 for i in range(depth)
             ]

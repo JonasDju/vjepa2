@@ -141,12 +141,18 @@ class RoPEAttention(nn.Module):
         has_cls_first=False,
         interpolate_rope=False,
         patch_size=16,
+        use_qk_norm=False,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim = dim // num_heads
         self.scale = qk_scale or head_dim**-0.5
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        # ViT-22B QK-norm: LayerNorm over head_dim on Q and K (per head, learnable
+        # affine), applied to the raw per-head Q/K before RoPE rotation. nn.Identity
+        # when off -> zero new params, forward numerically unchanged.
+        self.q_norm = nn.LayerNorm(head_dim) if use_qk_norm else nn.Identity()
+        self.k_norm = nn.LayerNorm(head_dim) if use_qk_norm else nn.Identity()
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop_prob = proj_drop
@@ -211,6 +217,10 @@ class RoPEAttention(nn.Module):
 
         qkv = self.qkv(x).unflatten(-1, (3, self.num_heads, -1)).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # -- QK-norm (before RoPE rotation, ViT-22B style); nn.Identity when off
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         if mask is not None:
             mask = mask.unsqueeze(1).repeat(1, self.num_heads, 1)
@@ -313,12 +323,17 @@ class Attention(nn.Module):
         proj_drop=0.0,
         use_sdpa=True,
         is_causal=False,
+        use_qk_norm=False,
     ):
         super().__init__()
         self.num_heads = num_heads
-        head_dim = dim // num_heads
+        self.head_dim = head_dim = dim // num_heads
         self.scale = qk_scale or head_dim**-0.5
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        # ViT-22B QK-norm: LayerNorm over head_dim on Q and K before attention.
+        # nn.Identity when off -> zero new params, forward numerically unchanged.
+        self.q_norm = nn.LayerNorm(head_dim) if use_qk_norm else nn.Identity()
+        self.k_norm = nn.LayerNorm(head_dim) if use_qk_norm else nn.Identity()
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop_prob = proj_drop
@@ -334,6 +349,10 @@ class Attention(nn.Module):
             .permute(2, 0, 3, 1, 4)
         )
         q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # -- QK-norm (ViT-22B style); nn.Identity when off
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         if self.use_sdpa:
             with torch.backends.cuda.sdp_kernel():
@@ -374,6 +393,7 @@ class Block(nn.Module):
         has_cls_first=False,
         interpolate_rope=False,
         patch_size=16,
+        use_qk_norm=False,
         **kwargs,
     ):
         super().__init__()
@@ -394,6 +414,7 @@ class Block(nn.Module):
                 has_cls_first=has_cls_first,
                 interpolate_rope=interpolate_rope,
                 patch_size=patch_size,
+                use_qk_norm=use_qk_norm,
             )
         else:
             self.attn = Attention(
@@ -405,6 +426,7 @@ class Block(nn.Module):
                 use_sdpa=use_sdpa,
                 is_causal=is_causal,
                 proj_drop=drop,
+                use_qk_norm=use_qk_norm,
             )
 
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()

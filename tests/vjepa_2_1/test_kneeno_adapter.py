@@ -170,10 +170,12 @@ class ClassificationEvaluatorAgainstVJepaEncoderTest(unittest.TestCase):
             metrics = evaluator.evaluate(self.model, tasks=[task], epoch=0)
             self.assertTrue(any(k.startswith(task) for k in metrics))
 
-    def test_linear_task_rejected_without_cls_token(self):
+    def test_linear_task_dropped_without_cls_token(self):
+        # V-JEPA 2.1 has no cls token; ClassificationEvaluator drops "linear"
+        # with a warning rather than raising (see kneeno/evaluation/classification.py).
         evaluator = ClassificationEvaluator(config=self._config(), adapter=self.adapter, dataset=self.dataset)
-        with self.assertRaises(ValueError):
-            evaluator.evaluate(self.model, tasks=["linear"], epoch=0)
+        metrics = evaluator.evaluate(self.model, tasks=["linear"], epoch=0)
+        self.assertEqual(metrics, {})
 
 
 if __name__ == "__main__":

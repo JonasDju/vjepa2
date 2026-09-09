@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from timm.models.layers import drop_path
+from torch.nn import Identity, LayerNorm, RMSNorm
 
 
 def rotate_queries_or_keys(x, pos, n_registers, has_cls_first):
@@ -52,6 +53,17 @@ def rotate_queries_or_keys(x, pos, n_registers, has_cls_first):
     out = torch.cat(parts, dim=-2)
 
     return out
+
+def get_norm_layer(qk_norm: str) -> type[RMSNorm | LayerNorm | Identity]:
+    match qk_norm.lower():
+        case "none":
+            return nn.Identity
+        case "layer":
+            return nn.LayerNorm
+        case "rms":
+            return nn.RMSNorm
+        case _:
+            raise ValueError(f"Got qk_norm value '{qk_norm}'. Expected one of 'none', 'layer', 'rms'")
 
 
 class DropPath(nn.Module):
@@ -141,12 +153,18 @@ class RoPEAttention(nn.Module):
         has_cls_first=False,
         interpolate_rope=False,
         patch_size=16,
+        qk_norm="none",
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim = dim // num_heads
         self.scale = qk_scale or head_dim**-0.5
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+
+        norm = get_norm_layer(qk_norm)
+        self.q_norm = norm(head_dim)
+        self.k_norm = norm(head_dim)
+
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop_prob = proj_drop
@@ -211,6 +229,9 @@ class RoPEAttention(nn.Module):
 
         qkv = self.qkv(x).unflatten(-1, (3, self.num_heads, -1)).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
+
+        q = self.q_norm(q).to(v.dtype)
+        k = self.k_norm(k).to(v.dtype)
 
         if mask is not None:
             mask = mask.unsqueeze(1).repeat(1, self.num_heads, 1)
@@ -313,12 +334,18 @@ class Attention(nn.Module):
         proj_drop=0.0,
         use_sdpa=True,
         is_causal=False,
+        qk_norm="none",
     ):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = qk_scale or head_dim**-0.5
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+
+        norm = get_norm_layer(qk_norm)
+        self.q_norm = norm(head_dim)
+        self.k_norm = norm(head_dim)
+
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop_prob = proj_drop
@@ -334,6 +361,9 @@ class Attention(nn.Module):
             .permute(2, 0, 3, 1, 4)
         )
         q, k, v = qkv[0], qkv[1], qkv[2]
+
+        q = self.q_norm(q).to(v.dtype)
+        k = self.k_norm(k).to(v.dtype)
 
         if self.use_sdpa:
             with torch.backends.cuda.sdp_kernel():
@@ -374,6 +404,7 @@ class Block(nn.Module):
         has_cls_first=False,
         interpolate_rope=False,
         patch_size=16,
+        qk_norm="none",
         **kwargs,
     ):
         super().__init__()
@@ -394,6 +425,7 @@ class Block(nn.Module):
                 has_cls_first=has_cls_first,
                 interpolate_rope=interpolate_rope,
                 patch_size=patch_size,
+                qk_norm=qk_norm,
             )
         else:
             self.attn = Attention(
@@ -405,6 +437,7 @@ class Block(nn.Module):
                 use_sdpa=use_sdpa,
                 is_causal=is_causal,
                 proj_drop=drop,
+                qk_norm=qk_norm,
             )
 
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()

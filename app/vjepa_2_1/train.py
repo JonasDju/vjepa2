@@ -44,6 +44,8 @@ log_freq = 10
 CHECKPOINT_FREQ = 1
 GARBAGE_COLLECT_ITR_FREQ = 50
 MAX_REPEAT_COUNTS = 10
+# Abort the run if the non-finite-gradient guard skips this many iterations in a row:
+MAX_CONSECUTIVE_NONFINITE = 25
 
 def compute_grad_norm(parameters, norm_type=2.0):
     """Global gradient norm over ``parameters``.
@@ -595,6 +597,7 @@ def main(args, resume_preempt=False):
 
     trailing_losses = []
     step_count = 0
+    consecutive_nonfinite = 0  # non-finite-grad guard: skips in a row (across epochs)
 
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
@@ -858,14 +861,23 @@ def main(args, resume_preempt=False):
             iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
             loss_meter.update(loss)
 
-            if not step_out["grads_finite"]:
+            if step_out["grads_finite"]:
+                consecutive_nonfinite = 0
+            else:
                 epoch_skips += 1
+                consecutive_nonfinite += 1
                 logger.warning(
                     "[nonfinite-grad] epoch %d itr %d: skipped the "
-                    "optimizer step + EMA update",
+                    "optimizer step + EMA update (%d in a row)",
                     epoch + 1,
                     itr,
+                    consecutive_nonfinite,
                 )
+                if consecutive_nonfinite > MAX_CONSECUTIVE_NONFINITE:
+                    raise RuntimeError(
+                        f"{consecutive_nonfinite} consecutive non-finite-gradient "
+                        f"iterations (last at epoch {epoch + 1} itr {itr}); aborting."
+                    )
 
             iter_time_meter.update(iter_elapsed_time_ms)
             gpu_time_meter.update(gpu_etime_ms)

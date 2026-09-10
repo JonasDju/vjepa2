@@ -35,6 +35,14 @@ MASK_CFGS = [
 ]
 
 
+def _channel_last(t):
+    """kneeno returns channel-first ``(1, D, H, W)``; ``MIDataset`` flips it back to
+    the channel-last ``(D, H, W, 1)`` layout VideoTransform expects. Mirror that
+    flip here so parity assertions compare like with like."""
+    arr = t.numpy() if torch.is_tensor(t) else t
+    return np.moveaxis(arr, 0, -1)
+
+
 def make_dataset(root):
     rng = np.random.default_rng(0)
     meta = {}
@@ -69,7 +77,7 @@ class MIDatasetWrapperTest(unittest.TestCase):
             buffer, label, clip_indices = wrapped[i]
             self.assertEqual(label, 0)
             self.assertEqual(len(buffer), 1)
-            self.assertTrue(np.array_equal(buffer[0], core[i].numpy()))
+            self.assertTrue(np.array_equal(buffer[0], _channel_last(core[i])))
             self.assertEqual(buffer[0].dtype, np.uint8)
             self.assertEqual(len(clip_indices), 1)
             self.assertTrue(
@@ -86,11 +94,11 @@ class MIDatasetWrapperTest(unittest.TestCase):
 
         wrapped = MIDataset(self.root, self.meta, transform=fake_transform)
         buffer, _, _ = wrapped[2]
-        self.assertTrue(np.array_equal(calls[0], core[2].numpy()))
+        self.assertTrue(np.array_equal(calls[0], _channel_last(core[2])))
         self.assertTrue(
             torch.equal(
                 buffer[0],
-                torch.as_tensor(core[2].numpy()).permute(3, 0, 1, 2).float(),
+                torch.as_tensor(_channel_last(core[2])).permute(3, 0, 1, 2).float(),
             )
         )
 

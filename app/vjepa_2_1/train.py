@@ -30,12 +30,12 @@ from app.vjepa_2_1.utils import (
     load_checkpoint,
     normalize_nested,
 )
+from kneeno.config import expand_env_vars
 from kneeno.evaluation import ClassificationEvaluator, tasks_due
 from src.datasets.data_manager import init_data
 from src.datasets.kneeno_adapter import VJepa21Adapter
 from src.masks.multiseq_multiblock3d import MaskCollator
 from src.masks.utils import apply_masks
-from src.utils.config import expand_env_vars
 from src.utils.distributed import init_distributed
 from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
 from torch.nn.parallel import DistributedDataParallel

@@ -29,10 +29,10 @@ import torch
 import yaml
 from app.vjepa_2_1.utils import init_video_model
 from app.vjepa_2_1.train import NORMALIZE_MI, NORMALIZE_RGB
+from kneeno.config import expand_env_vars
 from kneeno.evaluation import ClassificationEvaluator
 from src.datasets.kneeno_adapter import VJepa21Adapter
 from src.utils.checkpoint_loader import robust_checkpoint_loader
-from src.utils.config import expand_env_vars
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__, force=True)

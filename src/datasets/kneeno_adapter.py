@@ -46,20 +46,20 @@ class VJepa21Adapter(EncoderAdapter):
         return self._embed_dim
 
     def prepare_input(self, volume):
-        """``(T, H, W, 1)`` raw volume -> ``(1, T, crop_size, crop_size)`` float32.
+        """``(1, D, H, W)`` raw volume -> ``(1, D, crop_size, crop_size)`` float32.
 
         Deterministic resize (shorter side -> ``crop_size``) + center crop, then
         normalize -- the eval-time counterpart of ``VideoTransform``'s random
-        resized crop. Depth (``T``) is left untouched here; any depth
+        resized crop. Depth (``D``) is left untouched here; any depth
         resampling is the labeled dataset's job (``series_depth`` /
         ``resample_mode``, matching ``UnlabeledKneeMRIDataset``), so evaluation
         preprocessing mirrors whatever the pretraining run used.
         """
         if not torch.is_tensor(volume):
             volume = torch.as_tensor(volume)
-        buffer = volume.float().permute(3, 0, 1, 2)  # (T, H, W, 1) -> (C, T, H, W), C=1
+        buffer = volume.float()  # (1, D, H, W) == (C, D, H, W), C=1
 
-        c, t, h, w = buffer.shape
+        c, d, h, w = buffer.shape
         if h <= w:
             new_h = self.crop_size
             new_w = max(self.crop_size, int(-(-w * self.crop_size // h)))  # ceil
@@ -67,19 +67,19 @@ class VJepa21Adapter(EncoderAdapter):
             new_h = max(self.crop_size, int(-(-h * self.crop_size // w)))  # ceil
             new_w = self.crop_size
 
-        frames = buffer.permute(1, 0, 2, 3)  # (C, T, H, W) -> (T, C, H, W)
+        frames = buffer.permute(1, 0, 2, 3)  # (C, D, H, W) -> (D, C, H, W)
         frames = F.interpolate(frames, size=(new_h, new_w), mode="bilinear", align_corners=False)
 
         top = (new_h - self.crop_size) // 2
         left = (new_w - self.crop_size) // 2
         frames = frames[:, :, top : top + self.crop_size, left : left + self.crop_size]
 
-        buffer = frames.permute(1, 0, 2, 3)  # (T, C, H, W) -> (C, T, H, W)
+        buffer = frames.permute(1, 0, 2, 3)  # (D, C, H, W) -> (C, D, H, W)
         buffer = (buffer - self.mean) / self.std
         return buffer
 
     def forward_features(self, model, batch):
-        """``batch``: ``(B, 1, T, crop_size, crop_size)`` (the default ``collate``
+        """``batch``: ``(B, 1, D, crop_size, crop_size)`` (the default ``collate``
         stacks ``prepare_input`` outputs along a new batch axis, which is exactly
         what ``MultiSeqWrapper`` expects for a single fpc bucket).
 

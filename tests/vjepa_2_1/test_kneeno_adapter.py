@@ -76,7 +76,7 @@ class VJepa21AdapterTest(unittest.TestCase):
         self.adapter = VJepa21Adapter(embed_dim=EMBED_DIM, crop_size=CROP_SIZE, normalize=((0.5,), (0.5,)))
         rng = np.random.default_rng(0)
         self.volume = torch.from_numpy(
-            rng.integers(0, 256, size=(NUM_FRAMES, H, W, 1), dtype=np.uint8)
+            rng.integers(0, 256, size=(1, NUM_FRAMES, H, W), dtype=np.uint8)
         )
 
     def test_prepare_input_shape_and_dtype(self):
@@ -127,7 +127,7 @@ class InitVideoModelCompatibilityTest(unittest.TestCase):
         adapter = VJepa21Adapter(embed_dim=encoder.embed_dim, crop_size=CROP_SIZE, normalize=((0.5,), (0.5,)))
 
         rng = np.random.default_rng(0)
-        volume = torch.from_numpy(rng.integers(0, 256, size=(NUM_FRAMES, H, W, 1), dtype=np.uint8))
+        volume = torch.from_numpy(rng.integers(0, 256, size=(1, NUM_FRAMES, H, W), dtype=np.uint8))
         batch = adapter.collate([adapter.prepare_input(volume) for _ in range(2)])
 
         with torch.no_grad():

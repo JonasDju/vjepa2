@@ -9,9 +9,9 @@ import pprint
 from pathlib import Path
 
 import yaml
+from kneeno.config import expand_env_vars
 
 from app.scaffold import main as app_main
-from src.utils.config import expand_env_vars
 from src.utils.distributed import init_distributed
 
 parser = argparse.ArgumentParser()

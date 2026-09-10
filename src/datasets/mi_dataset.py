@@ -29,7 +29,8 @@ logger = getLogger()
 class MIDataset(torch.utils.data.Dataset):
     """Wrap ``kneeno.UnlabeledKneeMRIDataset`` to yield V-JEPA training samples.
 
-    Item shape mirrors ``VideoDataset``: ``([tensor (1, T, H, W)], 0, [arange(T)])``.
+    Item shape mirrors ``VideoDataset``: ``([tensor (1, D, H, W)], 0, [arange(D)])``
+    (``D`` = depth, i.e. the number of slices -- treated as video frames here).
     """
 
     def __init__(
@@ -59,12 +60,16 @@ class MIDataset(torch.utils.data.Dataset):
         return self._core.effective_depth(index)
 
     def __getitem__(self, index):
-        # (T, H, W, 1) ndarray -- the same array the old loader passed to the transform.
-        vol = self._core[index].numpy()
+        # kneeno now returns channel-first (1, D, H, W); flip it back to the
+        # channel-last (D, H, W, 1) layout that VideoTransform (shared with the
+        # genuine video / ImageNet paths, must not be modified) expects. This
+        # makes the pre-transform array byte-for-byte what the old loader passed
+        # in -- do not "simplify" this flip away.
+        vol = self._core[index].numpy()[0, ..., None]  # (1, D, H, W) -> (D, H, W, 1)
         depth = vol.shape[0]
         buffer = vol
         if self.transform is not None:
-            buffer = self.transform(buffer)  # (1, T, H, W) float tensor
+            buffer = self.transform(buffer)  # (1, D, H, W) float tensor
         buffer = [buffer]
         label = 0
         clip_indices = [np.arange(depth, dtype=np.int64)]

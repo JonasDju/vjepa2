@@ -155,9 +155,9 @@ class ClassificationEvaluatorAgainstVJepaEncoderTest(unittest.TestCase):
         config = {
             "seed": 3,
             "split": {"test_fraction": 0.3},
-            "data": {"series_depth": NUM_FRAMES, "batch_size": 4, "num_workers": 0},
+            "data": {"series_depth": NUM_FRAMES, "num_workers": 0},
             "logging": {"tensorboard_dir": None},
-            "knn": {"k": [3]},
+            "knn": {"k": [3], "batch_size": 4},
             "linear_pool": {"epochs": 1, "batch_size": 4},
             "attentive_pool": {"epochs": 1, "batch_size": 4, "num_heads": 4},
         }

@@ -46,6 +46,24 @@ log_freq = 10
 CHECKPOINT_FREQ = 1
 GARBAGE_COLLECT_ITR_FREQ = 50
 MAX_REPEAT_COUNTS = 10
+# Abort the run if the non-finite-gradient guard skips this many iterations in a row:
+MAX_CONSECUTIVE_NONFINITE = 25
+
+def compute_grad_norm(parameters, norm_type=2.0):
+    """Global gradient norm over ``parameters``.
+    Read-only: unlike ``torch.nn.utils.clip_grad_norm_`` this never rescales the
+    gradients (and never raises on a non-finite norm), so it does not change training
+    behaviour. Returns a python float (may be ``inf``/``nan``).
+    """
+    grads = [p.grad.detach() for p in parameters if p.grad is not None]
+    if not grads:
+        return float("nan")
+    device = grads[0].device
+    total = torch.norm(
+        torch.stack([torch.norm(g.float(), norm_type).to(device) for g in grads]),
+        norm_type,
+    )
+    return float(total)
 
 _GLOBAL_SEED = 0
 random.seed(_GLOBAL_SEED)
@@ -126,6 +144,9 @@ def main(args, resume_preempt=False):
     lambda_value_vid = cfgs_model.get("lambda_value_vid", 0.0)
     n_registers_predictor = cfgs_model.get("n_registers_predictor", 0)
     lambda_progressive = cfgs_model.get("lambda_progressive", True)
+    lambda_warmup_start_iter = cfgs_model.get("lambda_warmup_start_iter", 15000)
+    lambda_warmup_end_iter = cfgs_model.get("lambda_warmup_end_iter", 30000)
+    qk_norm = cfgs_model.get("qk_norm", "none")
     normalize_predictor = cfgs_model.get("normalize_predictor", False)
     modality_embedding = cfgs_model.get("modality_embedding", False)
     levels_predictor = cfgs_model.get("levels_predictor", 4)
@@ -363,6 +384,8 @@ def main(args, resume_preempt=False):
         ("%d", "epoch"),
         ("%d", "itr"),
         ("%.5f", "loss"),
+        ("%.5f", "loss-pred"),
+        ("%.5f", "loss-context"),
         ("%d", "iter-time(ms)"),
         ("%d", "gpu-time(ms)"),
         ("%d", "dataload-time(ms)"),
@@ -401,6 +424,7 @@ def main(args, resume_preempt=False):
         has_cls_first=has_cls_first,
         interpolate_rope=interpolate_rope,
         modality_embedding=modality_embedding,
+        qk_norm=qk_norm,
     )
     target_encoder = copy.deepcopy(encoder)
 
@@ -504,7 +528,15 @@ def main(args, resume_preempt=False):
         ema[0] + i * (ema[1] - ema[0]) / (ipe * num_epochs * ipe_scale)
         for i in range(int(ipe * num_epochs) + 1)
     )
-    lambda_sched = Lambda_LinearWarmupHold(lambda_value=lambda_value)
+    lambda_sched = Lambda_LinearWarmupHold(
+        lambda_value=lambda_value,
+        start_iter=lambda_warmup_start_iter,
+        end_iter=lambda_warmup_end_iter
+    )
+    logger.info(
+        f"context-loss lambda warmup: 0 -> {lambda_value} over global iters "
+        f"[{lambda_warmup_start_iter}, {lambda_warmup_end_iter}]"
+    )
 
     start_epoch = 0
     # -- load training checkpoint
@@ -591,12 +623,14 @@ def main(args, resume_preempt=False):
 
     trailing_losses = []
     step_count = 0
+    consecutive_nonfinite = 0  # non-finite-grad guard: skips in a row (across epochs)
 
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
         logger.info("Epoch %d" % (epoch + 1))
 
         loss_meter = AverageMeter()
+        epoch_skips = 0
         mask_meters = {fpc: AverageMeter() for fpc in dataset_fpcs}
         iter_time_meter = AverageMeter()
         gpu_time_meter = AverageMeter()
@@ -746,6 +780,7 @@ def main(args, resume_preempt=False):
                             return loss
 
                 # Step 1. Forward
+                loss_context = None
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
                     h = forward_target(clips)
                     z_pred, z_context = forward_context(clips)
@@ -773,6 +808,10 @@ def main(args, resume_preempt=False):
                             lambda_value_step = lambda_value
                         loss += loss_context * lambda_value_step
 
+                loss_v = float(loss)
+                loss_pred_v = float(loss_pred)
+                loss_context_v = float(loss_context) if loss_context is not None else float("nan")
+
                 # Step 2. Backward & step
                 run_step = True
                 if loss_reg_std_mult is not None:
@@ -791,47 +830,81 @@ def main(args, resume_preempt=False):
                             f"Loss {loss} is above bound {meanval} + {loss_reg_std_mult} * {stdval}. Skipping step."
                         )
 
+                grads_finite = True
                 if run_step:
                     if scaler is not None:
                         scaler.scale(loss).backward()
                         scaler.unscale_(optimizer)
                     else:
                         loss.backward()
-                    if scaler is not None:
-                        scaler.step(optimizer)
+
+                    enc_params = list(encoder.parameters())
+                    pred_params = list(predictor.parameters())
+                    grad_norm = compute_grad_norm(enc_params + pred_params)
+                    grads_finite = bool(np.isfinite(grad_norm))
+
+                    if grads_finite:
+                        if scaler is not None:
+                            scaler.step(optimizer)
+                            scaler.update()
+                        else:
+                            optimizer.step()
+                    elif scaler is not None:
+                        # let the scaler back off its scale, as scaler.step() would have
                         scaler.update()
-                    else:
-                        optimizer.step()
                 optimizer.zero_grad()
 
                 # Step 3. momentum update of target encoder
                 m = min(next(momentum_scheduler), ema[1])
-                with torch.no_grad():
-                    params_k = []
-                    params_q = []
-                    for param_q, param_k in zip(
-                        encoder.parameters(), target_encoder.parameters()
-                    ):
-                        params_k.append(param_k)
-                        params_q.append(param_q)
-                    torch._foreach_mul_(params_k, m)
-                    torch._foreach_add_(params_k, params_q, alpha=1 - m)
+                if run_step and grads_finite:
+                    with torch.no_grad():
+                        params_k = []
+                        params_q = []
+                        for param_q, param_k in zip(
+                            encoder.parameters(), target_encoder.parameters()
+                        ):
+                            params_k.append(param_k)
+                            params_q.append(param_q)
+                        torch._foreach_mul_(params_k, m)
+                        torch._foreach_add_(params_k, params_q, alpha=1 - m)
 
-                return (
-                    float(loss),
-                    _new_lr,
-                    _new_wd,
-                    run_step,
-                )
+                return {
+                    "loss": loss_v,
+                    "lr": _new_lr,
+                    "wd": _new_wd,
+                    "run_step": run_step,
+                    "loss_pred": loss_pred_v,
+                    "loss_context": loss_context_v,
+                    "grads_finite": grads_finite,
+                }
 
-            (
-                loss,
-                _new_lr,
-                _new_wd,
-                run_step,
-            ), gpu_etime_ms = gpu_timer(train_step)
+            step_out, gpu_etime_ms = gpu_timer(train_step)
+            loss = step_out["loss"]
+            _new_lr = step_out["lr"]
+            _new_wd = step_out["wd"]
+            run_step = step_out["run_step"]
+
             iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
             loss_meter.update(loss)
+
+            if step_out["grads_finite"]:
+                consecutive_nonfinite = 0
+            else:
+                epoch_skips += 1
+                consecutive_nonfinite += 1
+                logger.warning(
+                    "[nonfinite-grad] epoch %d itr %d: skipped the "
+                    "optimizer step + EMA update (%d in a row)",
+                    epoch + 1,
+                    itr,
+                    consecutive_nonfinite,
+                )
+                if consecutive_nonfinite > MAX_CONSECUTIVE_NONFINITE:
+                    raise RuntimeError(
+                        f"{consecutive_nonfinite} consecutive non-finite-gradient "
+                        f"iterations (last at epoch {epoch + 1} itr {itr}); aborting."
+                    )
+
             iter_time_meter.update(iter_elapsed_time_ms)
             gpu_time_meter.update(gpu_etime_ms)
             data_elapsed_time_meter.update(data_elapsed_time_ms)
@@ -854,6 +927,8 @@ def main(args, resume_preempt=False):
                     epoch + 1,
                     itr,
                     loss,
+                    step_out["loss_pred"],
+                    step_out["loss_context"],
                     iter_elapsed_time_ms,
                     gpu_etime_ms,
                     data_elapsed_time_ms,
@@ -865,7 +940,8 @@ def main(args, resume_preempt=False):
                     or np.isinf(loss)
                 ):
                     logger.info(
-                        "[%d, %5d] loss: %.3f "
+                        "[%d, %5d] loss: %.3f (cur: %.3f max: %.3f) "
+                        "[pred: %.3f ctx: %.3f] "
                         "masks: %s "
                         "[wd: %.2e] [lr: %.2e] "
                         "[mem: %.2e] "
@@ -876,6 +952,10 @@ def main(args, resume_preempt=False):
                             epoch + 1,
                             itr,
                             loss_meter.avg,
+                            loss_meter.val,
+                            loss_meter.max,
+                            step_out["loss_pred"],
+                            step_out["loss_context"],
                             "["
                             + ", ".join(
                                 [
@@ -898,6 +978,13 @@ def main(args, resume_preempt=False):
 
         # -- Save Checkpoint
         logger.info("avg. loss %.3f" % loss_meter.avg)
+        logger.info(
+            "[epoch %d summary] guard-skipped=%d"
+            % (
+                epoch + 1,
+                epoch_skips,
+            )
+        )
         if (epoch + 1) % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1):
             save_checkpoint(epoch + 1, latest_path)
             if save_every_freq > 0 and (epoch + 1) % save_every_freq == 0:

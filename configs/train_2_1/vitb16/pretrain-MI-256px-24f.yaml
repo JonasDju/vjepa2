@@ -75,6 +75,10 @@ model:
   is_causal: false
   lambda_value_img: 0.5
   lambda_value_vid: 0.5
+  lambda_progressive: true
+  lambda_warmup_start_iter: 15000
+  lambda_warmup_end_iter: 30000
+  qk_norm: none                    # one of "none", "layer", "rms"
   local_window:
   - -1
   - -1
@@ -103,16 +107,15 @@ optimization:
   - 0.99925
   - 0.99925
   epochs: 200
-  # lr scaled down for single-GPU global batch 48; upstream lr 6e-4 targets the
-  # ~3072 global batch of the 64-GPU pretrain config. final_lr == lr (WSD: the decay
-  # phase lives in the separate cooldown config).
-  final_lr: 0.0001
-  final_weight_decay: 0.04
+  warmup: 40
   ipe: 300
   ipe_scale: 1.25
-  lr: 0.0001
-  start_lr: 0.00002
-  warmup: 40
+  # lr scaled down for single-GPU global batch 48; upstream lr 6e-4 targets the
+  # ~3072 global batch of the 64-GPU pretrain config.
+  final_lr: 0.00005
+  final_weight_decay: 0.04
+  lr: 0.00005
+  start_lr: 0.00001
   weight_decay: 0.04
 
 # KneeNo classification evaluation, run on the frozen (target) encoder every

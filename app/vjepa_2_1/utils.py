@@ -213,6 +213,7 @@ def init_video_model(
     has_cls_first=False,
     interpolate_rope=False,
     modality_embedding=False,
+    qk_norm="none",
 ):
     encoder = video_vit.__dict__[model_name](
         img_size=crop_size,
@@ -233,6 +234,7 @@ def init_video_model(
         has_cls_first=has_cls_first,
         interpolate_rope=interpolate_rope,
         modality_embedding=modality_embedding,
+        qk_norm=qk_norm,
     )
     encoder = MultiSeqWrapper(encoder)
     predictor = vit_pred.__dict__["vit_predictor"](
@@ -263,6 +265,7 @@ def init_video_model(
         interpolate_rope=interpolate_rope,
         modality_embedding=modality_embedding,
         img_temporal_dim_size=img_temporal_dim_size,
+        qk_norm=qk_norm,
     )
     predictor = PredictorMultiSeqWrapper(predictor)
 

@@ -17,7 +17,7 @@ epoch, here the fine-tuning procedure itself is what we care about.
 Usage::
 
     .venv/bin/python -m app.vjepa_2_1.eval_classification \\
-        --fname configs/train_2_1/vitb16/pretrain-MI-256px-16f.yaml \\
+        --fname configs/train_2_1/vitb16/pretrain-MI-256px-24f.yaml \\
         --checkpoint /path/to/latest.pth.tar \\
         --tasks knn linear_pool attentive_pool
 """

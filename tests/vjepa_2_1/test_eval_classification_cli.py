@@ -17,16 +17,18 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
 import torch
 import yaml
-from PIL import Image
 
 from app.vjepa_2_1.utils import init_video_model
+from tests.vjepa_2_1.labeled_fixture import make_labeled_dataset
 from tests.vjepa_2_1.test_kneeno_adapter import CROP_SIZE, NUM_FRAMES, PATCH_SIZE, TUBELET_SIZE
 
 H, W = 20, 24
-SPEC = {f"c{i}": {"cor": 4, "sag": 6} for i in range(10)}
+# labeled (evaluation) data: two series of different depth per patient -> resampled to NUM_FRAMES
+SPEC = {f"c{i}": {"CORONAL_PROTON": 4, "SAGITTAL_PROTON": 6} for i in range(10)}
+# native-depth variant: every series already has the encoder's max_num_frames slices
+NATIVE_DEPTH_SPEC = {f"c{i}": {"CORONAL_PROTON": NUM_FRAMES, "SAGITTAL_PROTON": NUM_FRAMES} for i in range(10)}
 
 
 class EvalClassificationCliTest(unittest.TestCase):
@@ -34,25 +36,20 @@ class EvalClassificationCliTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
-        self.data_root = self.root / "data"
-        self._make_dataset()
         self._make_checkpoint()
-        self._make_config()
 
-    def _make_dataset(self):
-        rng = np.random.default_rng(0)
-        meta = {}
-        for case_id, series in SPEC.items():
-            meta[case_id] = {}
-            for name, n in series.items():
-                d = self.data_root / case_id / name
-                d.mkdir(parents=True)
-                for i in range(n):
-                    arr = rng.integers(0, 256, size=(H, W), dtype=np.uint8)
-                    Image.fromarray(arr, mode="L").save(d / f"{i:03d}.jpeg")
-                meta[case_id][name] = {"n_images": n, "resolution": [H, W]}
-        self.meta_path = self.root / "metadata.json"
-        self.meta_path.write_text(json.dumps(meta))
+    def _make_datasets(self, labeled_spec):
+        """Labeled NIfTI data for the eval block; unlabeled-schema metadata for the pretraining block.
+
+        The script never loads pretraining volumes -- it only reads ``data.data_meta`` (when
+        ``series_depth <= 0``) to size the encoder -- so no JPEGs are written.
+        """
+        self.labeled_root = self.root / "labeled"
+        self.labeled_meta_path = Path(make_labeled_dataset(self.labeled_root, labeled_spec, h=H, w=W))
+        self.pretrain_meta_path = self.root / "pretrain_metadata.json"
+        self.pretrain_meta_path.write_text(
+            json.dumps({"case0": {"cor": {"n_images": NUM_FRAMES, "resolution": [H, W]}}})
+        )
 
     def _make_checkpoint(self):
         encoder, predictor = init_video_model(
@@ -84,14 +81,14 @@ class EvalClassificationCliTest(unittest.TestCase):
             self.checkpoint_path,
         )
 
-    def _make_config(self):
+    def _make_config(self, series_depth):
         self.tb_dir = self.root / "tb"
         config = {
             "data": {
                 "dataset_type": "MIDataset",
-                "data_root": str(self.data_root),
-                "data_meta": str(self.meta_path),
-                "series_depth": NUM_FRAMES,
+                "data_root": str(self.root / "unlabeled"),
+                "data_meta": str(self.pretrain_meta_path),
+                "series_depth": series_depth,
                 "resample_mode": "nearest",
                 "patch_size": PATCH_SIZE,
                 "tubelet_size": TUBELET_SIZE,
@@ -108,10 +105,9 @@ class EvalClassificationCliTest(unittest.TestCase):
                 "seed": 1,
                 "split": {"test_fraction": 0.3},
                 "data": {
-                    "data_root": str(self.data_root),
-                    "label_meta": str(self.meta_path),
-                    "num_classes": 3,
-                    "series_depth": NUM_FRAMES,
+                    "data_root": str(self.labeled_root),
+                    "label_meta": str(self.labeled_meta_path),
+                    "series_depth": series_depth,
                     "batch_size": 4,
                     "num_workers": 0,
                 },
@@ -125,6 +121,18 @@ class EvalClassificationCliTest(unittest.TestCase):
         self.config_path.write_text(yaml.dump(config))
 
     def test_cli_runs_and_logs_one_point_per_head_epoch(self):
+        self._make_datasets(SPEC)
+        self._make_config(series_depth=NUM_FRAMES)
+        self._run_and_check_tensorboard()
+
+    def test_cli_with_native_depth_reads_encoder_depth_from_unlabeled_metadata(self):
+        # series_depth <= 0: max_num_frames comes from UnlabeledKneeMRIDataset.get_series_depths(data_meta)
+        # and the labeled data is evaluated at native depth with depth-bucketed batches.
+        self._make_datasets(NATIVE_DEPTH_SPEC)
+        self._make_config(series_depth=0)
+        self._run_and_check_tensorboard()
+
+    def _run_and_check_tensorboard(self):
         from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
         from app.vjepa_2_1 import eval_classification

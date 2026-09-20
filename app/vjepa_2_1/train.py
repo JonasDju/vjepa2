@@ -6,8 +6,6 @@
 
 import os
 
-from kneeno import UnlabeledKneeMRIDataset
-
 # -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
 try:
     os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["SLURM_LOCALID"]
@@ -164,7 +162,7 @@ def main(args, resume_preempt=False):
         if series_depth and series_depth > 0:
             dataset_fpcs = [series_depth]
         else:
-            from src.datasets.mi_dataset import UnlabeledKneeMRIDataset
+            from kneeno.dataset import UnlabeledKneeMRIDataset
 
             dataset_fpcs = UnlabeledKneeMRIDataset.get_series_depths(mi_data_meta)
     else:

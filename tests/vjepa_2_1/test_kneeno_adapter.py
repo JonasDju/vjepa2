@@ -11,46 +11,27 @@ actual patch-embedding / forward path, not just the adapter's own logic.
 (``hierarchical_layers`` is only populated for depth in {12, 24, 40, 48}).
 """
 
-import json
 import tempfile
 import unittest
-from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image
 
 import app.vjepa_2_1.models.vision_transformer as video_vit
 from app.vjepa_2_1.utils import init_video_model
 from app.vjepa_2_1.wrappers import MultiSeqWrapper
 from kneeno import ClassificationEvaluator, LabeledKneeMRIDataset
 from src.datasets.kneeno_adapter import VJepa21Adapter
+from tests.vjepa_2_1.labeled_fixture import make_labeled_dataset
 
 H, W = 20, 24
-SPEC = {f"c{i}": {"cor": 4, "sag": 6} for i in range(10)}
+SPEC = {f"c{i}": {"CORONAL_PROTON": 4, "SAGITTAL_PROTON": 6} for i in range(10)}
 
 EMBED_DIM = 16
 CROP_SIZE = 32
 PATCH_SIZE = 8
 TUBELET_SIZE = 2
 NUM_FRAMES = 4
-
-
-def make_dataset(root, spec=SPEC, h=H, w=W):
-    rng = np.random.default_rng(0)
-    meta = {}
-    for case_id, series in spec.items():
-        meta[case_id] = {}
-        for name, n in series.items():
-            d = Path(root) / case_id / name
-            d.mkdir(parents=True)
-            for i in range(n):
-                arr = rng.integers(0, 256, size=(h, w), dtype=np.uint8)
-                Image.fromarray(arr, mode="L").save(d / f"{i:03d}.jpeg")
-            meta[case_id][name] = {"n_images": n, "resolution": [h, w]}
-    p = Path(root) / "metadata.json"
-    p.write_text(json.dumps(meta))
-    return str(p)
 
 
 def make_tiny_encoder():
@@ -144,9 +125,9 @@ class ClassificationEvaluatorAgainstVJepaEncoderTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.meta = make_dataset(self._tmp.name)
+        self.meta = make_labeled_dataset(self._tmp.name, SPEC, h=H, w=W)
         self.dataset = LabeledKneeMRIDataset(
-            self._tmp.name, self.meta, num_classes=3, series_depth=NUM_FRAMES, resample_mode="nearest"
+            self._tmp.name, self.meta, series_depth=NUM_FRAMES, resample_mode="nearest"
         )
         self.model = make_tiny_encoder()
         self.adapter = VJepa21Adapter(embed_dim=EMBED_DIM, crop_size=CROP_SIZE, normalize=((0.5,), (0.5,)))

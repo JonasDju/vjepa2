@@ -134,9 +134,9 @@ def main():
     if series_depth and series_depth > 0:
         max_num_frames = series_depth
     else:
-        from kneeno import get_series_depths
+        from kneeno.dataset import UnlabeledKneeMRIDataset
 
-        max_num_frames = max(get_series_depths(cfgs_data["data_meta"]))
+        max_num_frames = max(UnlabeledKneeMRIDataset.get_series_depths(cfgs_data["data_meta"]))
 
     device = torch.device(args.device)
 

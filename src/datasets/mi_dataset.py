@@ -9,10 +9,6 @@ Volume loading, metadata parsing, depth resampling and the depth-bucket sampler
 live in the ``kneeno`` package so the DINOv2 side can reuse them. This module
 only adds the V-JEPA sample format ``(buffer, label, clip_indices)`` and applies
 the V-JEPA video transform.
-
-``get_series_depths`` and ``DistributedDepthBucketSampler`` are re-exported here
-so existing imports (``app/vjepa_2_1/train.py``, ``src/datasets/data_manager.py``)
-keep working unchanged.
 """
 
 from logging import getLogger
@@ -20,10 +16,10 @@ from logging import getLogger
 import numpy as np
 import torch
 
-from kneeno.dataset import UnlabeledKneeMRIDataset, get_series_depths  # noqa: F401
-from kneeno.sampler import DistributedDepthBucketSampler  # noqa: F401
+from kneeno.dataset import UnlabeledKneeMRIDataset
+from kneeno.sampler import DistributedDepthBucketSampler
 
-logger = getLogger()
+logger = getLogger(__name__)
 
 
 class MIDataset(torch.utils.data.Dataset):

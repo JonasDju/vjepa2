@@ -6,9 +6,9 @@ mem_per_gpu: 220G
 folder: /hpcwork/va105917/vjepa/pretrain_2_1/16.8.vitb.256px.16f
 data:
   dataset_type: MIDataset
-  data_root: /dev/shm/kneeno_data
+  data_root: $TMP/kneeno_data/unlabeled
   data_meta: /hpcwork/p0021834/workspace_roman/jonas/BigKneeTar/metadata.json
-  series_depth: 0
+  series_depth: 24
   resample_mode: nearest  # only used when series_depth > 0: "nearest" or "interpolate"
   batch_size: 48
   crop_size: 256
@@ -118,21 +118,18 @@ optimization:
 # KneeNo classification evaluation, run on the frozen (target) encoder every
 # eval.freq.<task> epochs -- see KneeNo/kneeno/evaluation/config.py for every
 # key. "linear" is explicitly disabled below: V-JEPA 2.1 has no cls token
-# (VJepa21Adapter.has_cls_token = False), so selecting it would raise.
+# (VJepa21Adapter.has_cls_token = False)
 eval:
   seed: 239
   encoder: target  # target (EMA) | online
   split:
     test_fraction: 0.2
   data:
-    # TODO: point at the real labeled classification dataset once it exists
-    # (see KneeNo/kneeno/evaluation/dataset.py -- LabeledKneeMRIDataset is a
-    # temporary stub until then).
-    data_root: /dev/shm/kneeno_data
-    label_meta: /hpcwork/p0021834/workspace_roman/jonas/BigKneeTar/labels.json
-    series_depth: 0  # match the series_depth above -- no resampling distribution shift
+    data_root: $TMP/kneeno_data/labeled
+    label_meta: /hpcwork/p0021834/workspace_roman/jonas/koeln_4s_histnorm_labels/combined.json
+    series_depth: 24  # match the series_depth above -- no resampling distribution shift
     resample_mode: nearest
-    num_workers: 8
+    num_workers: 16
   logging:
     tensorboard_dir: /hpcwork/va105917/vjepa/pretrain_2_1/16.8.vitb.256px.16f/eval_tb
     tag_prefix: eval

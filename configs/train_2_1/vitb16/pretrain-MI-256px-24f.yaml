@@ -7,7 +7,7 @@ folder: /hpcwork/va105917/vjepa/pretrain_2_1/16.8.vitb.256px.16f
 data:
   dataset_type: MIDataset
   data_root: $TMP/kneeno_data/unlabeled
-  data_meta: /hpcwork/p0021834/workspace_roman/jonas/BigKneeTar/metadata.json
+  data_meta: /hpcwork/p0021834/workspace_roman/jonas/BigKneeTar/metadata_unlabeled.json
   series_depth: 24
   resample_mode: nearest  # only used when series_depth > 0: "nearest" or "interpolate"
   batch_size: 48
@@ -125,14 +125,20 @@ optimization:
 eval:
   seed: 239
   encoder: target  # target (EMA) | online
+  amp_dtype: bfloat16  # frozen-encoder forward under autocast (CUDA only); null -> float32. Heads still train in float32.
+  cache_features: true  # linear / linear_pool train on embeddings extracted once per evaluation instead of
+                        # re-encoding every head epoch; k-NN always uses the shared pass. attentive_pool never caches.
   split:
     test_fraction: 0.2
   data:
-    data_root: $TMP/kneeno_data/labeled
-    label_meta: /hpcwork/p0021834/workspace_roman/jonas/koeln_4s_histnorm_labels/combined.json
+    data_root: $TMP/kneeno_data/unlabeled
+    label_meta: /hpcwork/p0021834/workspace_roman/jonas/BigKneeTar/metadata_labeled.json
     series_depth: 24  # match the series_depth above -- no resampling distribution shift
     resample_mode: nearest
     num_workers: 16
+    subset: 4000  # seeded subsample of the labeled series: float in (0, 1] = fraction, int > 1 = count, 1.0 = all
+    multiprocessing_context: fork  # eval DataLoader worker start method; null -> inherit. Workers must never touch CUDA
+    persistent_workers: true  # keep workers alive across head epochs (ignored when num_workers = 0)
   logging:
     tensorboard_dir: /hpcwork/va105917/vjepa/pretrain_2_1/16.8.vitb.256px.16f/eval_tb
     tag_prefix: eval

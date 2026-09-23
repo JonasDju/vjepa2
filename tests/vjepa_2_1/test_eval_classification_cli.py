@@ -21,14 +21,14 @@ import torch
 import yaml
 
 from app.vjepa_2_1.utils import init_video_model
-from tests.vjepa_2_1.labeled_fixture import make_labeled_dataset
+from tests.vjepa_2_1.labeled_fixture import make_internal_labeled_dataset
 from tests.vjepa_2_1.test_kneeno_adapter import CROP_SIZE, NUM_FRAMES, PATCH_SIZE, TUBELET_SIZE
 
 H, W = 20, 24
 # labeled (evaluation) data: two series of different depth per patient -> resampled to NUM_FRAMES
-SPEC = {f"c{i}": {"CORONAL_PROTON": 4, "SAGITTAL_PROTON": 6} for i in range(10)}
+SPEC = {f"c{i}": {"cor": 4, "sag": 6} for i in range(10)}
 # native-depth variant: every series already has the encoder's max_num_frames slices
-NATIVE_DEPTH_SPEC = {f"c{i}": {"CORONAL_PROTON": NUM_FRAMES, "SAGITTAL_PROTON": NUM_FRAMES} for i in range(10)}
+NATIVE_DEPTH_SPEC = {f"c{i}": {"cor": NUM_FRAMES, "sag": NUM_FRAMES} for i in range(10)}
 
 
 class EvalClassificationCliTest(unittest.TestCase):
@@ -39,16 +39,19 @@ class EvalClassificationCliTest(unittest.TestCase):
         self._make_checkpoint()
 
     def _make_datasets(self, labeled_spec):
-        """Labeled NIfTI data for the eval block; unlabeled-schema metadata for the pretraining block.
+        """Labeled data for the eval block; unlabeled-schema metadata for the pretraining block.
+
+        The labeled data is in the internal (JPEG + ``"cases"``) layout, because the script lets
+        ``ClassificationEvaluator`` build its own dataset, which is a ``LabeledInternalKneeMRIDataset``.
 
         The script never loads pretraining volumes -- it only reads ``data.data_meta`` (when
         ``series_depth <= 0``) to size the encoder -- so no JPEGs are written.
         """
         self.labeled_root = self.root / "labeled"
-        self.labeled_meta_path = Path(make_labeled_dataset(self.labeled_root, labeled_spec, h=H, w=W))
+        self.labeled_meta_path = Path(make_internal_labeled_dataset(self.labeled_root, labeled_spec, h=H, w=W))
         self.pretrain_meta_path = self.root / "pretrain_metadata.json"
         self.pretrain_meta_path.write_text(
-            json.dumps({"case0": {"cor": {"n_images": NUM_FRAMES, "resolution": [H, W]}}})
+            json.dumps({"case0": {"cor": {"dimensions": [H, W, NUM_FRAMES]}}})
         )
 
     def _make_checkpoint(self):

@@ -3,7 +3,7 @@ nodes: 8
 tasks_per_node: 8
 cpus_per_task: 8
 mem_per_gpu: 220G
-folder: /hpcwork/va105917/vjepa/pretrain_2_1/16.8.vitb.256px.16f
+folder: /hpcwork/va105917/vjepa/pretrain_2_1/16.8.vitb.256px.24f
 data:
   dataset_type: MIDataset
   data_root: $TMP/kneeno_data/unlabeled
@@ -136,18 +136,19 @@ eval:
     series_depth: 24  # match the series_depth above -- no resampling distribution shift
     resample_mode: nearest
     num_workers: 16
-    subset: 4000  # seeded subsample of the labeled series: float in (0, 1] = fraction, int > 1 = count, 1.0 = all
+    subset: 12000  # seeded subsample of the labeled series: float in (0, 1] = fraction, int > 1 = count, 1.0 = all
     multiprocessing_context: fork  # eval DataLoader worker start method; null -> inherit. Workers must never touch CUDA
     persistent_workers: true  # keep workers alive across head epochs (ignored when num_workers = 0)
   logging:
-    tensorboard_dir: /hpcwork/va105917/vjepa/pretrain_2_1/16.8.vitb.256px.16f/eval_tb
+    tensorboard_dir: /hpcwork/va105917/vjepa/pretrain_2_1/16.8.vitb.256px.24f/eval_tb
+    per_label_dir: /hpcwork/va105917/vjepa/pretrain_2_1/16.8.vitb.256px.24f/eval_per_sample
     tag_prefix: eval
   freq:
     knn: 1
     linear: null  # V-JEPA 2.1 has no cls token -- explicitly override the default's freq (omitting
                   # this key would leave the default "linear: 5" in place via the config merge)
-    linear_pool: 5
-    attentive_pool: 5
+    linear_pool: 1
+    attentive_pool: 10
   knn:
     k: [5, 20]
     metric: cosine

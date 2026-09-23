@@ -54,7 +54,7 @@ def make_dataset(root):
             for i in range(n):
                 arr = rng.integers(0, 256, size=(H, W), dtype=np.uint8)
                 Image.fromarray(arr, mode="L").save(d / f"{i:03d}.jpeg")
-            meta[case_id][name] = {"n_images": n, "resolution": [H, W]}
+            meta[case_id][name] = {"dimensions": [H, W, n]}
     p = Path(root) / "metadata.json"
     p.write_text(json.dumps(meta))
     return str(p)

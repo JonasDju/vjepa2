@@ -20,7 +20,7 @@ import torch
 import app.vjepa_2_1.models.vision_transformer as video_vit
 from app.vjepa_2_1.utils import init_video_model
 from app.vjepa_2_1.wrappers import MultiSeqWrapper
-from kneeno import ClassificationEvaluator, LabeledKneeMRIDataset
+from kneeno import ClassificationEvaluator, LabeledExternalKneeMRIDataset
 from src.datasets.kneeno_adapter import VJepa21Adapter
 from tests.vjepa_2_1.labeled_fixture import make_labeled_dataset
 
@@ -126,7 +126,7 @@ class ClassificationEvaluatorAgainstVJepaEncoderTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.meta = make_labeled_dataset(self._tmp.name, SPEC, h=H, w=W)
-        self.dataset = LabeledKneeMRIDataset(
+        self.dataset = LabeledExternalKneeMRIDataset(
             self._tmp.name, self.meta, series_depth=NUM_FRAMES, resample_mode="nearest"
         )
         self.model = make_tiny_encoder()

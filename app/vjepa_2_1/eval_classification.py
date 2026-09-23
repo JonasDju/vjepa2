@@ -157,7 +157,7 @@ def main():
     finally:
         # Flush+close the TensorBoard writer so buffered scalars are not lost
         # if the process exits right after
-        evaluator.tb.close()
+        evaluator.cleanup()
 
     logger.info("final metrics: %s", metrics)
     pprint.pprint(metrics)

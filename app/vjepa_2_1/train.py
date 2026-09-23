@@ -1008,4 +1008,4 @@ def main(args, resume_preempt=False):
                 logger.info(f"[epoch {epoch + 1}] eval ({due_tasks}): {eval_metrics}")
 
     if evaluator is not None:
-        evaluator.tb.close()
+        evaluator.cleanup()

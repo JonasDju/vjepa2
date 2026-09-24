@@ -14,6 +14,7 @@ except Exception:
 
 import copy
 import gc
+import logging
 import random
 import time
 
@@ -273,6 +274,12 @@ def main(args, resume_preempt=False):
 
     # -- init torch distributed backend
     world_size, rank = init_distributed()
+    # app/main.py silences ranks != 0, but the module-level get_logger(force=True) above
+    # resets the root logger to INFO when this module is imported -> re-apply per rank.
+    # captureWarnings routes warnings.warn through logging so they are filtered too.
+    logging.captureWarnings(True)
+    if rank != 0:
+        logging.getLogger().setLevel(logging.ERROR)
     data_world_size, data_rank = world_size, rank
     logger.info(f"Initialized (rank/world-size) {rank}/{world_size}")
     img_world_size = 0

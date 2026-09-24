@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+from datetime import timedelta
 from pathlib import Path
 
 import torch
@@ -12,6 +13,11 @@ import torch.distributed as dist
 from src.utils.logging import get_logger
 
 logger = get_logger()
+
+# How long a collective may wait before the NCCL watchdog aborts the job (default: 10 min). The
+# KneeNo evaluation in app/vjepa_2_1/train.py runs on rank 0 only while every other rank waits
+# in a barrier, which with attentive_pool on a large eval subset takes hours.
+PROCESS_GROUP_TIMEOUT = timedelta(minutes=180)
 
 
 def init_distributed(port=37129, rank_and_world_size=(None, None)):
@@ -43,7 +49,9 @@ def init_distributed(port=37129, rank_and_world_size=(None, None)):
 
     try:
         os.environ["MASTER_PORT"] = str(port)
-        torch.distributed.init_process_group(backend="nccl", world_size=world_size, rank=rank)
+        torch.distributed.init_process_group(
+            backend="nccl", world_size=world_size, rank=rank, timeout=PROCESS_GROUP_TIMEOUT
+        )
     except Exception as e:
         world_size, rank = 1, 0
         logger.info(f"Rank: {rank}. Distributed training not available {e}")

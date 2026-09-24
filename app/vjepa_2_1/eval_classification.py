@@ -92,22 +92,25 @@ def build_encoder(cfgs_data, cfgs_model, in_chans, max_num_frames, device):
         has_cls_first=cfgs_model.get("has_cls_first", False),
         interpolate_rope=cfgs_model.get("interpolate_rope", False),
         modality_embedding=cfgs_model.get("modality_embedding", False),
+        qk_norm=cfgs_model.get("qk_norm", "none"),
     )
     return encoder
 
 
 def load_frozen_encoder(checkpoint_path, encoder, state_dict_key):
-    """Load one encoder's weights from a pretraining checkpoint, freeze it."""
+    """Load one encoder's weights from a pretraining checkpoint, freeze it.
+
+    ``train.py`` saves the DDP-wrapped encoders, so the checkpoint's keys carry a ``module.``
+    prefix the bare ``MultiSeqWrapper`` built here does not have; it is stripped. Loading is
+    strict: a missing, unexpected or differently shaped parameter means the rebuilt
+    architecture does not match the checkpoint (e.g. a ``model:`` key not forwarded to
+    ``init_video_model``), and a partially loaded encoder would silently be evaluated with
+    (partly) random weights.
+    """
     checkpoint = robust_checkpoint_loader(checkpoint_path, map_location=torch.device("cpu"))
-    pretrained_dict = checkpoint[state_dict_key]
-    for k, v in encoder.state_dict().items():
-        if k not in pretrained_dict:
-            logger.info(f'key "{k}" could not be found in loaded state dict')
-        elif pretrained_dict[k].shape != v.shape:
-            logger.info(f'key "{k}" is of different shape in model and loaded state dict')
-            pretrained_dict[k] = v
-    msg = encoder.load_state_dict(pretrained_dict, strict=False)
-    logger.info(f"loaded pretrained {state_dict_key!r} from epoch {checkpoint.get('epoch')} with msg: {msg}")
+    pretrained_dict = {k.removeprefix("module."): v for k, v in checkpoint[state_dict_key].items()}
+    encoder.load_state_dict(pretrained_dict, strict=True)
+    logger.info(f"loaded pretrained {state_dict_key!r} from epoch {checkpoint.get('epoch')}")
 
     for p in encoder.parameters():
         p.requires_grad = False

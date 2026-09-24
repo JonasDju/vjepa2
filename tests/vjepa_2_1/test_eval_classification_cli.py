@@ -67,13 +67,16 @@ class EvalClassificationCliTest(unittest.TestCase):
             pred_embed_dim=32,
             use_rope=True,
             modality_embedding=True,
+            qk_norm="rms",
         )
+        # train.py saves the DDP-wrapped modules, so every key carries a "module." prefix
+        ddp_state = {f"module.{k}": v for k, v in encoder.state_dict().items()}
         self.checkpoint_path = self.root / "latest.pth.tar"
         torch.save(
             {
-                "encoder": encoder.state_dict(),
-                "predictor": predictor.state_dict(),
-                "target_encoder": encoder.state_dict(),
+                "encoder": ddp_state,
+                "predictor": {f"module.{k}": v for k, v in predictor.state_dict().items()},
+                "target_encoder": ddp_state,
                 "epoch": 3,
                 "opt": {},
                 "scaler": None,
@@ -103,6 +106,7 @@ class EvalClassificationCliTest(unittest.TestCase):
                 "pred_embed_dim": 32,
                 "use_rope": True,
                 "modality_embedding": True,
+                "qk_norm": "rms",
             },
             "eval": {
                 "seed": 1,
@@ -134,6 +138,25 @@ class EvalClassificationCliTest(unittest.TestCase):
         self._make_datasets(NATIVE_DEPTH_SPEC)
         self._make_config(series_depth=0)
         self._run_and_check_tensorboard()
+
+    def test_loads_every_weight_of_a_ddp_checkpoint(self):
+        # Regression: the "module." prefix of train.py's DDP checkpoints and the config's qk_norm
+        # were both dropped once, and load_state_dict(strict=False) skipped the unmatched weights
+        # silently -- the script evaluated a randomly initialised encoder.
+        from app.vjepa_2_1.eval_classification import build_encoder, load_frozen_encoder
+
+        self._make_datasets(SPEC)
+        self._make_config(series_depth=NUM_FRAMES)
+        config = yaml.safe_load(self.config_path.read_text())
+        encoder = build_encoder(config["data"], config["model"], 1, NUM_FRAMES, torch.device("cpu"))
+        encoder = load_frozen_encoder(str(self.checkpoint_path), encoder, "target_encoder")
+
+        saved = torch.load(self.checkpoint_path, map_location="cpu")["target_encoder"]
+        loaded = encoder.state_dict()
+        self.assertEqual({f"module.{k}" for k in loaded}, set(saved))
+        self.assertTrue(any(".q_norm." in k for k in loaded))
+        for k, v in loaded.items():
+            self.assertTrue(torch.equal(v, saved[f"module.{k}"]), k)
 
     def _run_and_check_tensorboard(self):
         from tensorboard.backend.event_processing.event_accumulator import EventAccumulator

@@ -386,6 +386,7 @@ def main(args, resume_preempt=False):
         ("%.5f", "loss"),
         ("%.5f", "loss-pred"),
         ("%.5f", "loss-context"),
+        ("%.4e", "grad-norm"),
         ("%d", "iter-time(ms)"),
         ("%d", "gpu-time(ms)"),
         ("%d", "dataload-time(ms)"),
@@ -831,6 +832,7 @@ def main(args, resume_preempt=False):
                         )
 
                 grads_finite = True
+                grad_norm = float("nan")  # stays nan when the loss regulariser skipped the step
                 if run_step:
                     if scaler is not None:
                         scaler.scale(loss).backward()
@@ -876,6 +878,7 @@ def main(args, resume_preempt=False):
                     "loss_pred": loss_pred_v,
                     "loss_context": loss_context_v,
                     "grads_finite": grads_finite,
+                    "grad_norm": grad_norm,
                 }
 
             step_out, gpu_etime_ms = gpu_timer(train_step)
@@ -929,6 +932,7 @@ def main(args, resume_preempt=False):
                     loss,
                     step_out["loss_pred"],
                     step_out["loss_context"],
+                    step_out["grad_norm"],
                     iter_elapsed_time_ms,
                     gpu_etime_ms,
                     data_elapsed_time_ms,
@@ -944,6 +948,7 @@ def main(args, resume_preempt=False):
                         "[pred: %.3f ctx: %.3f] "
                         "masks: %s "
                         "[wd: %.2e] [lr: %.2e] "
+                        "[grad: %.2e] "
                         "[mem: %.2e] "
                         "[iter: %.1f ms] "
                         "[gpu: %.1f ms] "
@@ -966,6 +971,7 @@ def main(args, resume_preempt=False):
                             + "]",
                             _new_wd,
                             _new_lr,
+                            step_out["grad_norm"],
                             torch.cuda.max_memory_allocated() / 1024.0**2,
                             iter_time_meter.avg,
                             gpu_time_meter.avg,

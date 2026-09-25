@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from timm.models.layers import drop_path
 from torch.nn import Identity, LayerNorm, RMSNorm
+from torch.nn.attention import SDPBackend
 
 
 def rotate_queries_or_keys(x, pos, n_registers, has_cls_first):
@@ -304,7 +305,9 @@ class RoPEAttention(nn.Module):
             k = torch.cat([kd, kh, kw], dim=-1)
 
         if self.use_sdpa:
-            with torch.backends.cuda.sdp_kernel():
+            with torch.nn.attention.sdpa_kernel(
+                [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH, SDPBackend.CUDNN_ATTENTION]
+            ):
                 x = F.scaled_dot_product_attention(
                     q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal
                 )
@@ -366,7 +369,9 @@ class Attention(nn.Module):
         k = self.k_norm(k).to(v.dtype)
 
         if self.use_sdpa:
-            with torch.backends.cuda.sdp_kernel():
+            with torch.nn.attention.sdpa_kernel(
+                [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH, SDPBackend.CUDNN_ATTENTION]
+            ):
                 x = F.scaled_dot_product_attention(
                     q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal
                 )
@@ -516,7 +521,9 @@ class CrossAttention(nn.Module):
         k, v = kv[0], kv[1]
 
         if self.use_sdpa:
-            with torch.backends.cuda.sdp_kernel():
+            with torch.nn.attention.sdpa_kernel(
+                [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH, SDPBackend.CUDNN_ATTENTION]
+            ):
                 q = F.scaled_dot_product_attention(q, k, v)
         else:
             xattn = (q @ k.transpose(-2, -1)) * self.scale

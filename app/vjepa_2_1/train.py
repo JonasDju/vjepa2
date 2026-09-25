@@ -122,7 +122,8 @@ def main(args, resume_preempt=False):
     # -- MODEL
     cfgs_model = args.get("model")
     compile_model = cfgs_model.get("compile_model", False)
-    use_activation_checkpointing = cfgs_model.get("use_activation_checkpointing", False)
+    use_activation_checkpointing = cfgs_model.get("use_activation_checkpointing", True)
+    activation_memory_budget = cfgs_model.get("activation_memory_budget", 0.5)
     model_name = cfgs_model.get("model_name")
     pred_depth = cfgs_model.get("pred_depth")
     pred_num_heads = cfgs_model.get("pred_num_heads", None)
@@ -442,6 +443,8 @@ def main(args, resume_preempt=False):
         encoder.compile()
         target_encoder.compile()
         predictor.compile()
+        if not use_activation_checkpointing:
+            torch._functorch.config.activation_memory_budget = activation_memory_budget
 
     mask_collator = MaskCollator(
         cfgs_mask=cfgs_mask,
@@ -789,7 +792,7 @@ def main(args, resume_preempt=False):
 
                 # Step 1. Forward
                 loss_context = None
-                with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
+                with torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=mixed_precision):
                     h = forward_target(clips)
                     z_pred, z_context = forward_context(clips)
                     loss = 0

@@ -18,6 +18,7 @@ import numpy as np
 import torch
 
 import app.vjepa_2_1.models.vision_transformer as video_vit
+from app.vjepa_2_1.train import NORMALIZE_MI, NORMALIZE_RGB
 from app.vjepa_2_1.utils import init_video_model
 from app.vjepa_2_1.wrappers import MultiSeqWrapper
 from kneeno import ClassificationEvaluator, LabeledExternalKneeMRIDataset
@@ -84,6 +85,69 @@ class VJepa21AdapterTest(unittest.TestCase):
 
     def test_has_no_cls_token(self):
         self.assertFalse(self.adapter.has_cls_token)
+
+
+class RepeatedChannelsTest(unittest.TestCase):
+    """n_channels > 1: the grayscale volume becomes a gray "RGB video" for the official checkpoints."""
+
+    def setUp(self):
+        rng = np.random.default_rng(0)
+        self.volume = torch.from_numpy(rng.integers(0, 256, size=(1, NUM_FRAMES, H, W), dtype=np.uint8))
+
+    def test_repeats_before_per_channel_normalization(self):
+        # each channel must be the gray volume normalized with *that* channel's mean/std -- identical to
+        # the 1-channel path run with the channel's (mean, std) alone
+        rgb = VJepa21Adapter(embed_dim=EMBED_DIM, n_channels=3, crop_size=CROP_SIZE, normalize=NORMALIZE_RGB)
+        prepped = rgb.prepare_input(self.volume)
+        self.assertEqual(tuple(prepped.shape), (3, NUM_FRAMES, CROP_SIZE, CROP_SIZE))
+        self.assertTrue(prepped.is_contiguous())
+        for c, (mean, std) in enumerate(zip(*NORMALIZE_RGB)):
+            gray = VJepa21Adapter(embed_dim=EMBED_DIM, crop_size=CROP_SIZE, normalize=((mean,), (std,)))
+            torch.testing.assert_close(prepped[c], gray.prepare_input(self.volume)[0])
+        self.assertFalse(torch.equal(prepped[0], prepped[1]))
+
+    def test_single_normalization_shared_by_all_channels(self):
+        adapter = VJepa21Adapter(embed_dim=EMBED_DIM, n_channels=3, crop_size=CROP_SIZE, normalize=NORMALIZE_MI)
+        prepped = adapter.prepare_input(self.volume)
+        self.assertEqual(prepped.shape[0], 3)
+        self.assertTrue(torch.equal(prepped[0], prepped[1]) and torch.equal(prepped[1], prepped[2]))
+
+    def test_rejects_normalization_for_another_channel_count(self):
+        # 1-channel adapter + RGB normalize used to broadcast the volume to 3 channels silently
+        with self.assertRaises(ValueError):
+            VJepa21Adapter(embed_dim=EMBED_DIM, n_channels=1, crop_size=CROP_SIZE, normalize=NORMALIZE_RGB)
+        with self.assertRaises(ValueError):
+            VJepa21Adapter(embed_dim=EMBED_DIM, n_channels=2, crop_size=CROP_SIZE, normalize=NORMALIZE_RGB)
+
+    def test_rejects_multichannel_input(self):
+        adapter = VJepa21Adapter(embed_dim=EMBED_DIM, n_channels=3, crop_size=CROP_SIZE, normalize=NORMALIZE_RGB)
+        with self.assertRaises(ValueError):
+            adapter.prepare_input(self.volume.repeat(3, 1, 1, 1))
+
+    def test_forward_through_rgb_encoder(self):
+        encoder, _ = init_video_model(
+            device=torch.device("cpu"),
+            patch_size=PATCH_SIZE,
+            max_num_frames=NUM_FRAMES,
+            tubelet_size=TUBELET_SIZE,
+            in_chans=3,
+            model_name="vit_tiny",
+            crop_size=CROP_SIZE,
+            pred_depth=12,
+            pred_embed_dim=32,
+            use_rope=True,
+            modality_embedding=True,
+        )
+        encoder.eval()
+        adapter = VJepa21Adapter(
+            embed_dim=encoder.embed_dim, n_channels=3, crop_size=CROP_SIZE, normalize=NORMALIZE_RGB
+        )
+        batch = adapter.collate([adapter.prepare_input(self.volume) for _ in range(2)])
+        self.assertEqual(tuple(batch.shape), (2, 3, NUM_FRAMES, CROP_SIZE, CROP_SIZE))
+        with torch.no_grad():
+            out = adapter.forward_features(encoder, batch)
+        n_tokens = (NUM_FRAMES // TUBELET_SIZE) * (CROP_SIZE // PATCH_SIZE) ** 2
+        self.assertEqual(tuple(out["patches"].shape), (2, n_tokens, encoder.embed_dim))
 
 
 class InitVideoModelCompatibilityTest(unittest.TestCase):

@@ -54,20 +54,20 @@ class EvalClassificationCliTest(unittest.TestCase):
             json.dumps({"case0": {"cor": {"dimensions": [H, W, NUM_FRAMES]}}})
         )
 
-    def _make_checkpoint(self):
+    def _make_checkpoint(self, in_chans=1, qk_norm="rms"):
         encoder, predictor = init_video_model(
             device=torch.device("cpu"),
             patch_size=PATCH_SIZE,
             max_num_frames=NUM_FRAMES,
             tubelet_size=TUBELET_SIZE,
-            in_chans=1,
+            in_chans=in_chans,
             model_name="vit_tiny",
             crop_size=CROP_SIZE,
             pred_depth=12,
             pred_embed_dim=32,
             use_rope=True,
             modality_embedding=True,
-            qk_norm="rms",
+            qk_norm=qk_norm,
         )
         # train.py saves the DDP-wrapped modules, so every key carries a "module." prefix
         ddp_state = {f"module.{k}": v for k, v in encoder.state_dict().items()}
@@ -87,7 +87,19 @@ class EvalClassificationCliTest(unittest.TestCase):
             self.checkpoint_path,
         )
 
-    def _make_config(self, series_depth):
+    def _make_official_checkpoint(self):
+        """Mirrors the layout of the official V-JEPA 2.1 checkpoints (e.g. vjepa2_1_vitb_dist_vitG_384.pt):
+        RGB patch embedding, no qk_norm, and the EMA encoder stored under "ema_encoder" (no "target_encoder").
+        The online encoder differs from the EMA one, so loading the wrong one is detectable."""
+        self._make_checkpoint(in_chans=3, qk_norm="none")
+        checkpoint = torch.load(self.checkpoint_path, map_location="cpu")
+        ema_state = checkpoint.pop("target_encoder")
+        checkpoint["encoder"] = {k: v + 1.0 for k, v in ema_state.items()}
+        checkpoint["ema_encoder"] = ema_state
+        torch.save(checkpoint, self.checkpoint_path)
+        return ema_state
+
+    def _make_config(self, series_depth, n_channels=None, qk_norm="rms"):
         self.tb_dir = self.root / "tb"
         config = {
             "data": {
@@ -106,7 +118,7 @@ class EvalClassificationCliTest(unittest.TestCase):
                 "pred_embed_dim": 32,
                 "use_rope": True,
                 "modality_embedding": True,
-                "qk_norm": "rms",
+                "qk_norm": qk_norm,
             },
             "eval": {
                 "seed": 1,
@@ -124,6 +136,8 @@ class EvalClassificationCliTest(unittest.TestCase):
                 "attentive_pool": {"epochs": 2, "batch_size": 4, "num_heads": 4},
             },
         }
+        if n_channels is not None:
+            config["model"]["n_channels"] = n_channels
         self.config_path = self.root / "config.yaml"
         self.config_path.write_text(yaml.dump(config))
 
@@ -157,6 +171,39 @@ class EvalClassificationCliTest(unittest.TestCase):
         self.assertTrue(any(".q_norm." in k for k in loaded))
         for k, v in loaded.items():
             self.assertTrue(torch.equal(v, saved[f"module.{k}"]), k)
+
+    def test_cli_runs_on_official_rgb_checkpoint(self):
+        # n_channels: 3 -> RGB encoder, volumes repeated to 3 channels; target -> the official "ema_encoder"
+        self._make_official_checkpoint()
+        self._make_datasets(SPEC)
+        self._make_config(series_depth=NUM_FRAMES, n_channels=3, qk_norm="none")
+        self._run_and_check_tensorboard()
+
+    def test_target_encoder_falls_back_to_official_ema_encoder(self):
+        from app.vjepa_2_1.eval_classification import (
+            ENCODER_STATE_DICT_KEYS,
+            build_encoder,
+            load_frozen_encoder,
+        )
+
+        ema_state = self._make_official_checkpoint()
+        self._make_datasets(SPEC)
+        self._make_config(series_depth=NUM_FRAMES, n_channels=3, qk_norm="none")
+        config = yaml.safe_load(self.config_path.read_text())
+        encoder = build_encoder(config["data"], config["model"], 3, NUM_FRAMES, torch.device("cpu"))
+        encoder = load_frozen_encoder(str(self.checkpoint_path), encoder, ENCODER_STATE_DICT_KEYS["target"])
+        for k, v in encoder.state_dict().items():
+            self.assertTrue(torch.equal(v, ema_state[f"module.{k}"]), k)
+
+    def test_missing_encoder_key_raises(self):
+        from app.vjepa_2_1.eval_classification import build_encoder, load_frozen_encoder
+
+        self._make_datasets(SPEC)
+        self._make_config(series_depth=NUM_FRAMES)
+        config = yaml.safe_load(self.config_path.read_text())
+        encoder = build_encoder(config["data"], config["model"], 1, NUM_FRAMES, torch.device("cpu"))
+        with self.assertRaises(KeyError):
+            load_frozen_encoder(str(self.checkpoint_path), encoder, ("ema_encoder",))
 
     def _run_and_check_tensorboard(self):
         from tensorboard.backend.event_processing.event_accumulator import EventAccumulator

@@ -32,10 +32,17 @@ class VJepa21Adapter(EncoderAdapter):
 
     has_cls_token = False
 
-    def __init__(self, embed_dim, crop_size=256, normalize=((0.5,), (0.5,))):
+    def __init__(self, embed_dim, n_channels=1, crop_size=256, normalize=((0.5,), (0.5,))):
         self._embed_dim = embed_dim
+        self.n_channels = n_channels
         self.crop_size = crop_size
         mean, std = normalize
+        # one (mean, std) per input channel, or a single pair shared by all of them; anything else would
+        # silently broadcast the volume to len(mean) channels regardless of n_channels
+        if len(mean) != len(std) or len(mean) not in (1, n_channels):
+            raise ValueError(
+                f"normalize has {len(mean)} mean / {len(std)} std values, expected 1 or n_channels={n_channels}"
+            )
         # ((0.5,), (0.5,)) is the MI normalization set in app/vjepa_2_1/train.py;
         # scaled by 255 to match uint8 pixel range, as VideoTransform does.
         self.mean = torch.tensor(mean, dtype=torch.float32).view(-1, 1, 1, 1) * 255.0
@@ -46,7 +53,7 @@ class VJepa21Adapter(EncoderAdapter):
         return self._embed_dim
 
     def prepare_input(self, volume):
-        """``(1, D, H, W)`` raw volume -> ``(1, D, crop_size, crop_size)`` float32.
+        """``(1, D, H, W)`` raw volume -> ``(C, D, crop_size, crop_size)`` float32.
 
         Deterministic resize (shorter side -> ``crop_size``) + center crop, then
         normalize -- the eval-time counterpart of ``VideoTransform``'s random
@@ -54,6 +61,10 @@ class VJepa21Adapter(EncoderAdapter):
         resampling is the labeled dataset's job (``series_depth`` /
         ``resample_mode``, matching ``UnlabeledKneeMRIDataset``), so evaluation
         preprocessing mirrors whatever the pretraining run used.
+        If ``n_channels`` is > 1, the grayscale volume is repeated ``n_channels`` times along the
+        channel axis *before* normalization, i.e. it becomes a gray "RGB video" (R = G = B) that is then
+        normalized per channel -- what the official RGB-pretrained checkpoints expect (with
+        ``NORMALIZE_RGB``).
         """
         if not torch.is_tensor(volume):
             volume = torch.as_tensor(volume)
@@ -67,19 +78,23 @@ class VJepa21Adapter(EncoderAdapter):
             new_h = max(self.crop_size, int(-(-h * self.crop_size // w)))  # ceil
             new_w = self.crop_size
 
-        frames = buffer.permute(1, 0, 2, 3)  # (C, D, H, W) -> (D, C, H, W)
+        frames = buffer.permute(1, 0, 2, 3)  # (1, D, H, W) -> (D, 1, H, W)
         frames = F.interpolate(frames, size=(new_h, new_w), mode="bilinear", align_corners=False)
 
         top = (new_h - self.crop_size) // 2
         left = (new_w - self.crop_size) // 2
         frames = frames[:, :, top : top + self.crop_size, left : left + self.crop_size]
 
-        buffer = frames.permute(1, 0, 2, 3)  # (D, C, H, W) -> (C, D, H, W)
+        buffer = frames.permute(1, 0, 2, 3)  # (D, 1, H, W) -> (1, D, H, W)
+        if self.n_channels > 1:
+            if c != 1:
+                raise ValueError(f"can only repeat a 1-channel volume to n_channels={self.n_channels}, got {c}")
+            buffer = buffer.repeat(self.n_channels, 1, 1, 1)  # (1, D, H, W) -> (n_channels, D, H, W)
         buffer = (buffer - self.mean) / self.std
         return buffer
 
     def forward_features(self, model, batch):
-        """``batch``: ``(B, 1, D, crop_size, crop_size)`` (the default ``collate``
+        """``batch``: ``(B, C, D, crop_size, crop_size)`` (the default ``collate``
         stacks ``prepare_input`` outputs along a new batch axis, which is exactly
         what ``MultiSeqWrapper`` expects for a single fpc bucket).
 

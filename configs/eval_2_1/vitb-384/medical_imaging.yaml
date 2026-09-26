@@ -16,7 +16,7 @@ model:
   compile_model: true
   use_activation_checkpointing: false
   activation_memory_budget: 0.5       # only used when compile_model = True and use_activation_checkpointing = False
-  n_channels: 3                       # number of image channels. If > 1, the volumes obtained by the KneeNo dataset are repeated n_channels times
+  n_channels: 1                       # number of image channels. If > 1, the volumes obtained by the KneeNo dataset are repeated n_channels times
                                       # Set to 3 when loading the official pretrained checkpoint
   has_cls_first: false
   img_temporal_dim_size: 1
@@ -70,7 +70,7 @@ eval:
     series_depth: 24  # match the series_depth above -- no resampling distribution shift
     resample_mode: nearest
     num_workers: 16
-    subset: 5000  # seeded subsample of the labeled series: float in (0, 1] = fraction, int > 1 = count, 1.0 = all
+    subset: 1.0  # seeded subsample of the labeled series: float in (0, 1] = fraction, int > 1 = count, 1.0 = all
     multiprocessing_context: fork  # eval DataLoader worker start method; null -> inherit. Workers must never touch CUDA
     persistent_workers: true  # keep workers alive across head epochs (ignored when num_workers = 0)
   logging:

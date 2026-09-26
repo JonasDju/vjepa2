@@ -27,7 +27,7 @@ model:
   lambda_progressive: true
   lambda_warmup_start_iter: 7500
   lambda_warmup_end_iter: 15000
-  qk_norm: none                    # one of "none", "layer", "rms"
+  qk_norm: rms                    # one of "none", "layer", "rms"
                                    # must be "none" when loading the official pretrained checkpoint
   local_window:
   - -1

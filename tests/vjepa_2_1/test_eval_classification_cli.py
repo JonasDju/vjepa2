@@ -11,7 +11,6 @@ checkpoint loading, and the standalone (``log_every_head_epoch=True``) call
 into ``ClassificationEvaluator`` in one pass.
 """
 
-import json
 import sys
 import tempfile
 import unittest
@@ -27,8 +26,6 @@ from tests.vjepa_2_1.test_kneeno_adapter import CROP_SIZE, NUM_FRAMES, PATCH_SIZ
 H, W = 20, 24
 # labeled (evaluation) data: two series of different depth per patient -> resampled to NUM_FRAMES
 SPEC = {f"c{i}": {"cor": 4, "sag": 6} for i in range(10)}
-# native-depth variant: every series already has the encoder's max_num_frames slices
-NATIVE_DEPTH_SPEC = {f"c{i}": {"cor": NUM_FRAMES, "sag": NUM_FRAMES} for i in range(10)}
 
 
 class EvalClassificationCliTest(unittest.TestCase):
@@ -39,20 +36,13 @@ class EvalClassificationCliTest(unittest.TestCase):
         self._make_checkpoint()
 
     def _make_datasets(self, labeled_spec):
-        """Labeled data for the eval block; unlabeled-schema metadata for the pretraining block.
+        """Labeled data for the eval block (the script never loads pretraining volumes).
 
         The labeled data is in the internal (JPEG + ``"cases"``) layout, because the script lets
         ``ClassificationEvaluator`` build its own dataset, which is a ``LabeledInternalKneeMRIDataset``.
-
-        The script never loads pretraining volumes -- it only reads ``data.data_meta`` (when
-        ``series_depth <= 0``) to size the encoder -- so no JPEGs are written.
         """
         self.labeled_root = self.root / "labeled"
         self.labeled_meta_path = Path(make_internal_labeled_dataset(self.labeled_root, labeled_spec, h=H, w=W))
-        self.pretrain_meta_path = self.root / "pretrain_metadata.json"
-        self.pretrain_meta_path.write_text(
-            json.dumps({"case0": {"cor": {"dimensions": [H, W, NUM_FRAMES]}}})
-        )
 
     def _make_checkpoint(self, in_chans=1, qk_norm="rms"):
         encoder, predictor = init_video_model(
@@ -99,13 +89,12 @@ class EvalClassificationCliTest(unittest.TestCase):
         torch.save(checkpoint, self.checkpoint_path)
         return ema_state
 
-    def _make_config(self, series_depth, n_channels=None, qk_norm="rms"):
+    def _make_config(self, series_depth, n_channels=None, qk_norm="rms", eval_series_depth="same"):
         self.tb_dir = self.root / "tb"
         config = {
             "data": {
                 "dataset_type": "MIDataset",
                 "data_root": str(self.root / "unlabeled"),
-                "data_meta": str(self.pretrain_meta_path),
                 "series_depth": series_depth,
                 "resample_mode": "nearest",
                 "patch_size": PATCH_SIZE,
@@ -126,7 +115,7 @@ class EvalClassificationCliTest(unittest.TestCase):
                 "data": {
                     "data_root": str(self.labeled_root),
                     "label_meta": str(self.labeled_meta_path),
-                    "series_depth": series_depth,
+                    "series_depth": series_depth if eval_series_depth == "same" else eval_series_depth,
                     "batch_size": 4,
                     "num_workers": 0,
                 },
@@ -146,12 +135,15 @@ class EvalClassificationCliTest(unittest.TestCase):
         self._make_config(series_depth=NUM_FRAMES)
         self._run_and_check_tensorboard()
 
-    def test_cli_with_native_depth_reads_encoder_depth_from_unlabeled_metadata(self):
-        # series_depth <= 0: max_num_frames comes from UnlabeledKneeMRIDataset.get_series_depths(data_meta)
-        # and the labeled data is evaluated at native depth with depth-bucketed batches.
-        self._make_datasets(NATIVE_DEPTH_SPEC)
-        self._make_config(series_depth=0)
-        self._run_and_check_tensorboard()
+    def test_native_depth_is_rejected_up_front(self):
+        # V-JEPA 2.1 has no native-depth mode: the encoder is sized for one depth and
+        # VJepa21Adapter keeps whatever depth it gets, so both blocks need series_depth > 0.
+        self._make_datasets(SPEC)
+        for pretrain, evaluation in ((0, NUM_FRAMES), (-1, NUM_FRAMES), (NUM_FRAMES, 0), (NUM_FRAMES, None)):
+            with self.subTest(pretrain=pretrain, evaluation=evaluation):
+                self._make_config(series_depth=pretrain, eval_series_depth=evaluation)
+                with self.assertRaisesRegex(ValueError, "series_depth must be a positive number"):
+                    self._run_main()
 
     def test_loads_every_weight_of_a_ddp_checkpoint(self):
         # Regression: the "module." prefix of train.py's DDP checkpoints and the config's qk_norm
@@ -205,9 +197,7 @@ class EvalClassificationCliTest(unittest.TestCase):
         with self.assertRaises(KeyError):
             load_frozen_encoder(str(self.checkpoint_path), encoder, ("ema_encoder",))
 
-    def _run_and_check_tensorboard(self):
-        from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
-
+    def _run_main(self):
         from app.vjepa_2_1 import eval_classification
 
         argv = [
@@ -230,6 +220,10 @@ class EvalClassificationCliTest(unittest.TestCase):
         finally:
             sys.argv = old_argv
 
+    def _run_and_check_tensorboard(self):
+        from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+        self._run_main()
         ea = EventAccumulator(str(self.tb_dir))
         ea.Reload()
         tags = ea.Tags()["scalars"]

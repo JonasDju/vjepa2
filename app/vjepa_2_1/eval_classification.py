@@ -37,6 +37,7 @@ from app.vjepa_2_1.train import NORMALIZE_MI, NORMALIZE_RGB
 from kneeno.config import expand_env_vars
 from kneeno.evaluation import ClassificationEvaluator
 from src.datasets.kneeno_adapter import VJepa21Adapter
+from src.datasets.mi_dataset import check_series_depth
 from src.utils.checkpoint_loader import robust_checkpoint_loader
 from src.utils.logging import get_logger
 
@@ -147,13 +148,11 @@ def main():
     is_mi_dataset = cfgs_data.get("dataset_type", "videodataset").lower() == "midataset"
     in_chans = cfgs_model.get("n_channels", 1 if is_mi_dataset else 3)
 
-    series_depth = cfgs_data.get("series_depth", 0)
-    if series_depth and series_depth > 0:
-        max_num_frames = series_depth
-    else:
-        from kneeno.dataset import UnlabeledKneeMRIDataset
-
-        max_num_frames = max(UnlabeledKneeMRIDataset.get_series_depths(cfgs_data["data_meta"]))
+    # the encoder is sized for the pretraining depth; the labeled volumes are resampled as well,
+    # since VJepa21Adapter keeps whatever depth it is given
+    max_num_frames = cfgs_data.get("series_depth")
+    check_series_depth(max_num_frames)
+    check_series_depth(cfgs_eval.get("data", {}).get("series_depth"), "eval.data.series_depth")
 
     device = torch.device(args.device)
 

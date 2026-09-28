@@ -35,6 +35,7 @@ from kneeno.config import expand_env_vars
 from kneeno.evaluation import ClassificationEvaluator, tasks_due
 from src.datasets.data_manager import init_data
 from src.datasets.kneeno_adapter import VJepa21Adapter
+from src.datasets.mi_dataset import check_series_depth
 from src.masks.multiseq_multiblock3d import MaskCollator
 from src.masks.utils import apply_masks
 from src.utils.distributed import init_distributed
@@ -176,18 +177,13 @@ def main(args, resume_preempt=False):
     # -- MI (medical imaging) dataset: folders of JPEG slices loaded as 3D volumes
     mi_data_root = cfgs_data.get("data_root")
     mi_data_meta = cfgs_data.get("data_meta")
-    # series_depth <= 0 -> keep every slice (depth-bucketing sampler);
-    # series_depth > 0 -> resample each volume to this many slices
-    series_depth = cfgs_data.get("series_depth", 0)
-    # depth-resampling method when series_depth > 0: "nearest" or "interpolate"
+    # every volume is resampled to this many slices (required, > 0, for MI data)
+    series_depth = cfgs_data.get("series_depth")
+    # depth-resampling method: "nearest" or "interpolate"
     resample_mode = cfgs_data.get("resample_mode", "nearest")
     if is_mi_dataset:
-        if series_depth and series_depth > 0:
-            dataset_fpcs = [series_depth]
-        else:
-            from kneeno.dataset import UnlabeledKneeMRIDataset
-
-            dataset_fpcs = UnlabeledKneeMRIDataset.get_series_depths(mi_data_meta)
+        check_series_depth(series_depth)
+        dataset_fpcs = [series_depth]
     else:
         dataset_fpcs = cfgs_data.get("dataset_fpcs")
     max_num_frames = max(dataset_fpcs)
@@ -263,6 +259,10 @@ def main(args, resume_preempt=False):
     # -- EVAL (KneeNo classification evaluation, run periodically during pretraining)
     # Absent "eval:" block -> evaluation is skipped entirely.
     cfgs_eval = args.get("eval")
+    if cfgs_eval is not None:
+        # VJepa21Adapter keeps the volume depth, so the labeled volumes must be resampled too;
+        # checked here rather than failing at the first evaluation batch
+        check_series_depth(cfgs_eval.get("data", {}).get("series_depth"), "eval.data.series_depth")
     # ----------------------------------------------------------------------- #
 
     np.random.seed(seed)

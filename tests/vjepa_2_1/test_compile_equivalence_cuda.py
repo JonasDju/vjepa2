@@ -16,6 +16,8 @@ Environment (all optional):
                                    realistic activations); otherwise random init (see Setup.build_models)
     VJEPA_COMPILE_TEST_STEPS       training steps compared per check (default 3, min 2)
     VJEPA_COMPILE_TEST_STRICT_BATCH  batch size of the fp32 check (default 4)
+    VJEPA_COMPILE_TEST_STRICT_REF_CHUNK  samples per chunk of its float64 reference (default 1: float64 attention
+                                   has no memory-efficient kernel, ~30 GB per sample at 256 px x 24 slices)
     VJEPA_COMPILE_TEST_REF_CHUNK   samples per chunk of the fp32 reference of the training-setting check (default 8)
 
 What is compared. The same batch (same volumes, same masks) goes through the uncompiled ("eager") and the
@@ -37,8 +39,8 @@ already is (FACTOR 2 for outputs / losses / the whole gradient vector, 5 per par
 Wrong indexing, a dropped/duplicated term or a broken recomputation shows up as an error of order 1, far
 above that. Two checks:
 
-1. ``test_1_fp32_strict`` -- float32 with TF32 off at a small batch vs. a float64 reference: the pure
-   "same math" check, tight floor.
+1. ``test_1_fp32_strict`` -- float32 with TF32 off at a small batch vs. a float64 reference (chunked like
+   the one below): the pure "same math" check, tight floor.
 2. ``test_2_training_setting`` -- the config's dtype (bfloat16 autocast), the config's batch size and
    ``activation_memory_budget``, TF32 as in training. The reference is the eager model in float32 (TF32
    off), run in chunks of VJEPA_COMPILE_TEST_REF_CHUNK samples with losses / gradients averaged: every loss
@@ -52,8 +54,11 @@ compiled graphs). Takes roughly 20-40 min on an H100, mostly compilation.
 """
 
 import copy
+import functools
+import gc
 import os
 import time
+import traceback
 import unittest
 
 import torch
@@ -216,8 +221,14 @@ class Setup:
 # --------------------------------------------------------------------------- one training step (train_step)
 
 
-def training_step(s, encoder, target_encoder, predictor, clips, masks_enc, masks_pred, autocast_dtype):
-    """Forward + loss + backward exactly like train.py's train_step; returns (outputs, grads) on the CPU."""
+def training_step(
+    s, encoder, target_encoder, predictor, clips, masks_enc, masks_pred, autocast_dtype, distance_weights=None
+):
+    """Forward + loss + backward exactly like train.py's train_step; returns (outputs, grads) on the CPU.
+
+    ``distance_weights``: precomputed ``compute_mask_distance`` result for exactly these masks (used by the
+    chunked references; the function squeezes away the batch dimension at batch size 1).
+    """
     embed_dim = s.embed_dim
 
     def forward_target(c):
@@ -284,7 +295,8 @@ def training_step(s, encoder, target_encoder, predictor, clips, masks_enc, masks
         loss = loss_pred
         loss_context = None
         if s.predict_all:
-            distance_weights = compute_mask_distance(masks_pred, masks_enc, s.grid_size, s.offset_context_loss)
+            if distance_weights is None:
+                distance_weights = compute_mask_distance(masks_pred, masks_enc, s.grid_size, s.offset_context_loss)
             d_weights = distance_weights if s.weight_distance_loss else None
             loss_context = loss_fn(z_context, h, masks_enc, cls_loss=False, d_weights=d_weights)
             loss = loss + loss_context * s.lambda_value
@@ -332,8 +344,13 @@ def run_steps(s, models, steps, device, autocast_dtype=None, chunk=None, input_d
         assert B % size == 0, f"batch {B} not divisible by chunk {size}"
         acc_out, acc_grad = None, None
         for start in range(0, B, size):
-            inputs = to_device(step, device, slice(start, start + size), input_dtype)
-            out, grads = training_step(s, *models, *inputs, autocast_dtype)
+            batch = slice(start, start + size)
+            inputs = to_device(step, device, batch, input_dtype)
+            # distance weights depend only on the masks: compute them for the full batch and slice
+            _, full_enc, full_pred = to_device(step, device)
+            dist = compute_mask_distance(full_pred, full_enc, s.grid_size, s.offset_context_loss)
+            dist = [[d[batch] for d in row] for row in dist]
+            out, grads = training_step(s, *models, *inputs, autocast_dtype, distance_weights=dist)
             if acc_out is None:
                 acc_out = {k: [v] for k, v in out.items()}
                 acc_grad = {k: v.double() / (B // size) for k, v in grads.items()}
@@ -419,6 +436,44 @@ def summarize(title, rows):
 # --------------------------------------------------------------------------- the checks
 
 
+def release_on_error(test):
+    """unittest keeps a failed test's traceback -- and with it every frame's locals (model copies, activations,
+    GPU tensors) -- until the run ends, so one failing check would starve the next one of GPU memory. Report the
+    traceback as text instead and clear the frames."""
+
+    @functools.wraps(test)
+    def wrapper(self):
+        try:
+            return test(self)
+        except AssertionError:
+            raise  # comparison failures hold only CPU results
+        except Exception as e:
+            text = "".join(traceback.format_exception(e))
+            traceback.clear_frames(e.__traceback__)
+            del e
+            free_cuda()
+            raise RuntimeError(f"check aborted:\n{text}") from None
+
+    return wrapper
+
+
+def free_cuda():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def phase(name, fn):
+    """Run one phase with its time and peak GPU memory printed; frees the cache afterwards."""
+    torch.cuda.reset_peak_memory_stats()
+    t0 = time.time()
+    result = fn()
+    peak = torch.cuda.max_memory_allocated() / 2**30
+    print(f"  {name}: {time.time() - t0:.0f}s, peak GPU memory {peak:.1f} GiB", flush=True)
+    free_cuda()
+    return result
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA-only (torch.compile on the training GPUs)")
 class CompileEquivalenceCudaTest(unittest.TestCase):
     @classmethod
@@ -438,7 +493,7 @@ class CompileEquivalenceCudaTest(unittest.TestCase):
         torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = self._tf32
         torch._functorch.config.activation_memory_budget = self._budget
         torch._dynamo.reset()
-        torch.cuda.empty_cache()
+        free_cuda()
 
     def compiled_copy(self, models, activation_memory_budget):
         copies = [copy.deepcopy(m) for m in models]
@@ -459,31 +514,41 @@ class CompileEquivalenceCudaTest(unittest.TestCase):
         self.assertGreater(graphs[-1], graphs[0], "the compiled model never recompiled for new mask shapes")
         return results
 
+    @release_on_error
     def test_1_fp32_strict(self):
         s, dev = self.s, self.device
         torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
         steps = s.make_steps(self.n_steps, env_int("VJEPA_COMPILE_TEST_STRICT_BATCH", 4))
+        ref_chunk = env_int("VJEPA_COMPILE_TEST_STRICT_REF_CHUNK", 1)
         ref_models = [copy.deepcopy(m).double() for m in self.base]
-        reference = run_steps(s, ref_models, steps, dev, input_dtype=torch.float64)
+        reference = phase(
+            "reference (float64)",
+            lambda: run_steps(s, ref_models, steps, dev, input_dtype=torch.float64, chunk=ref_chunk),
+        )
         del ref_models
-        eager = run_steps(s, self.base, steps, dev)
+        eager = phase("eager (float32)", lambda: run_steps(s, self.base, steps, dev))
         budget = None if s.use_activation_checkpointing else s.activation_memory_budget
-        compiled = self.run_compiled(self.compiled_copy(self.base, budget), steps)
+        compiled = phase("compiled (float32)", lambda: self.run_compiled(self.compiled_copy(self.base, budget), steps))
         failures, rows = compare(reference, eager, compiled, FLOOR["strict"])
         summarize("fp32 strict (reference: eager float64)", rows)
         self.assertFalse(failures, "\n".join(failures[:30]))
 
+    @release_on_error
     def test_2_training_setting(self):
         s, dev = self.s, self.device
         steps = s.make_steps(self.n_steps, s.batch_size)
         autocast = s.dtype if s.dtype != torch.float32 else None
         # reference: eager float32, TF32 off, chunked (exactly the full-batch math, see module docstring)
         torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
-        reference = run_steps(s, self.base, steps, dev, chunk=env_int("VJEPA_COMPILE_TEST_REF_CHUNK", 8))
+        ref_chunk = env_int("VJEPA_COMPILE_TEST_REF_CHUNK", 8)
+        reference = phase("reference (float32)", lambda: run_steps(s, self.base, steps, dev, chunk=ref_chunk))
         torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = self._tf32  # training defaults
-        eager = run_steps(s, self.base, steps, dev, autocast_dtype=autocast)
+        eager = phase(f"eager ({s.dtype})", lambda: run_steps(s, self.base, steps, dev, autocast_dtype=autocast))
         budget = None if s.use_activation_checkpointing else s.activation_memory_budget
-        compiled = self.run_compiled(self.compiled_copy(self.base, budget), steps, autocast_dtype=autocast)
+        compiled = phase(
+            f"compiled ({s.dtype})",
+            lambda: self.run_compiled(self.compiled_copy(self.base, budget), steps, autocast_dtype=autocast),
+        )
         failures, rows = compare(reference, eager, compiled, FLOOR["training"])
         title = f"training setting: {s.dtype}, batch {s.batch_size}, budget {budget} (reference: eager float32)"
         summarize(title, rows)

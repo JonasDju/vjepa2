@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
+import warnings
 
 import torch
 import torch.nn as nn
@@ -12,6 +13,12 @@ import torch.nn.functional as F
 
 from timm.models.layers import drop_path
 from torch.nn import Identity, LayerNorm, RMSNorm
+
+# The attention layers below deliberately use the deprecated torch.backends.cuda.sdp_kernel() (see the comment
+# in RoPEAttention.forward); silence only its deprecation warning, which is otherwise re-emitted on every trace.
+warnings.filterwarnings(
+    "ignore", message=r"`torch\.backends\.cuda\.sdp_kernel\(\)` is deprecated", category=FutureWarning
+)
 
 
 def rotate_queries_or_keys(x, pos, n_registers, has_cls_first):

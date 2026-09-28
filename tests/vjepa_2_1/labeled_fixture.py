@@ -20,7 +20,21 @@ from PIL import Image
 NUM_CLASSES = 3
 
 # Orientation each series' NIfTI is stored in (matches LabeledExternalKneeMRIDataset.TARGET_ORIENTATION's sources).
-SOURCE_ORIENTATION = {"CORONAL_PROTON": "LSA", "SAGITTAL_PROTON": "ASL"}
+SOURCE_ORIENTATION = {
+    "SAGITTAL_PROTON": "ASL",
+    "SAGITTAL_T1": "ASL",
+    "CORONAL_PROTON": "LSA",
+    "TRANSVERSAL_PROTON": "LAS",
+}
+
+# The labeled datasets only keep exams with all four sequences (their ``SEQUENCES``, in this order).
+EXTERNAL_SEQUENCES = ("SAGITTAL_PROTON", "SAGITTAL_T1", "CORONAL_PROTON", "TRANSVERSAL_PROTON")
+INTERNAL_SEQUENCES = ("sag", "st1", "cor", "tra")
+
+
+def full_exam_spec(n_exams, sequences, depths=(6, 5, 4, 7)):
+    """``{uid: {series_name: depth}}`` for ``n_exams`` complete exams."""
+    return {f"c{i}": dict(zip(sequences, depths)) for i in range(n_exams)}
 
 
 def make_labeled_dataset(root, spec, h, w, num_classes=NUM_CLASSES, seed=0):
@@ -52,7 +66,8 @@ def make_internal_labeled_dataset(root, spec, h, w, num_classes=NUM_CLASSES, see
     The metadata is ``{"label_names": [...], "cases": {case_id: {series: {"dimensions": [H, W, D]},
     ..., "labels": [...]}}}``, as ``merge_clinical_labels_into_unlabeled_meta.py`` writes it.
 
-    :param spec: ``{case_id: {series_name: depth}}``; any series names work.
+    :param spec: ``{case_id: {series_name: depth}}``; the dataset only keeps exams with every one of
+        ``INTERNAL_SEQUENCES``.
     """
     rng = np.random.default_rng(seed)
     cases = {}

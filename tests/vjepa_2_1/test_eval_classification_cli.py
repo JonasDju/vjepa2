@@ -20,12 +20,12 @@ import torch
 import yaml
 
 from app.vjepa_2_1.utils import init_video_model
-from tests.vjepa_2_1.labeled_fixture import make_internal_labeled_dataset
+from tests.vjepa_2_1.labeled_fixture import INTERNAL_SEQUENCES, full_exam_spec, make_internal_labeled_dataset
 from tests.vjepa_2_1.test_kneeno_adapter import CROP_SIZE, NUM_FRAMES, PATCH_SIZE, TUBELET_SIZE
 
 H, W = 20, 24
 # labeled (evaluation) data: two series of different depth per patient -> resampled to NUM_FRAMES
-SPEC = {f"c{i}": {"cor": 4, "sag": 6} for i in range(10)}
+SPEC = full_exam_spec(10, INTERNAL_SEQUENCES)  # 10 complete exams
 
 
 class EvalClassificationCliTest(unittest.TestCase):

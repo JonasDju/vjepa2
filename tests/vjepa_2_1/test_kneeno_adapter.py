@@ -23,10 +23,10 @@ from app.vjepa_2_1.utils import init_video_model
 from app.vjepa_2_1.wrappers import MultiSeqWrapper
 from kneeno import ClassificationEvaluator, LabeledExternalKneeMRIDataset
 from src.datasets.kneeno_adapter import VJepa21Adapter
-from tests.vjepa_2_1.labeled_fixture import make_labeled_dataset
+from tests.vjepa_2_1.labeled_fixture import EXTERNAL_SEQUENCES, full_exam_spec, make_labeled_dataset
 
 H, W = 20, 24
-SPEC = {f"c{i}": {"CORONAL_PROTON": 4, "SAGITTAL_PROTON": 6} for i in range(10)}
+SPEC = full_exam_spec(10, EXTERNAL_SEQUENCES)  # 10 complete exams
 
 EMBED_DIM = 16
 CROP_SIZE = 32

@@ -4,6 +4,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -65,6 +67,47 @@ def get_norm_layer(qk_norm: str) -> type[RMSNorm | LayerNorm | Identity]:
             return nn.RMSNorm
         case _:
             raise ValueError(f"Got qk_norm value '{qk_norm}'. Expected one of 'none', 'layer', 'rms'")
+
+
+class QKTemperature(nn.Module):
+    """Learnable per-head attention temperature, clamped to ``<= max_temperature``.
+
+    Multiplies the (normalised) queries of each head by ``t_h``, so with a non-affine
+    q/k norm (``||q|| = ||k|| = sqrt(head_dim)``) every attention logit is bounded by
+    ``t_max * sqrt(head_dim)``. Stored as ``log t`` (init 0, i.e. ``t = 1``); the clamp is
+    applied in the forward pass, so its gradient is zero while ``t`` sits at the cap.
+    """
+
+    def __init__(self, num_heads, max_temperature):
+        super().__init__()
+        self.log_temperature = nn.Parameter(torch.zeros(num_heads))
+        self.log_max = math.log(max_temperature)
+
+    def temperature(self):
+        return self.log_temperature.clamp(max=self.log_max).exp()
+
+    def forward(self, q):
+        return q * self.temperature().view(1, -1, 1, 1).to(q.dtype)
+
+    def extra_repr(self) -> str:
+        return f"num_heads={self.log_temperature.numel()}, max_temperature={math.exp(self.log_max):g}"
+
+
+def make_qk_temperature(qk_norm, qk_norm_affine, qk_temperature_max, num_heads):
+    """``QKTemperature`` when ``qk_temperature_max`` is set, else ``nn.Identity`` (no params)."""
+    if qk_temperature_max is None:
+        return nn.Identity()
+    if qk_norm.lower() == "none":
+        raise ValueError(
+            "qk_temperature_max requires qk_norm 'layer' or 'rms': without a q/k norm nothing bounds the logits"
+        )
+    if qk_norm_affine:
+        raise ValueError("qk_temperature_max requires qk_norm_affine=False: the norm's gain would stay unbounded")
+    if qk_temperature_max < 1.0:
+        raise ValueError(
+            f"qk_temperature_max must be >= 1 (the temperature is initialised to 1), got {qk_temperature_max}"
+        )
+    return QKTemperature(num_heads, qk_temperature_max)
 
 
 class DropPath(nn.Module):
@@ -155,6 +198,8 @@ class RoPEAttention(nn.Module):
         interpolate_rope=False,
         patch_size=16,
         qk_norm="none",
+        qk_norm_affine=True,
+        qk_temperature_max=None,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -163,8 +208,9 @@ class RoPEAttention(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
 
         norm = get_norm_layer(qk_norm)
-        self.q_norm = norm(head_dim)
-        self.k_norm = norm(head_dim)
+        self.q_norm = norm(head_dim, elementwise_affine=qk_norm_affine)
+        self.k_norm = norm(head_dim, elementwise_affine=qk_norm_affine)
+        self.qk_temperature = make_qk_temperature(qk_norm, qk_norm_affine, qk_temperature_max, num_heads)
 
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
@@ -231,7 +277,7 @@ class RoPEAttention(nn.Module):
         qkv = self.qkv(x).unflatten(-1, (3, self.num_heads, -1)).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        q = self.q_norm(q).to(v.dtype)
+        q = self.qk_temperature(self.q_norm(q)).to(v.dtype)
         k = self.k_norm(k).to(v.dtype)
 
         if mask is not None:
@@ -338,6 +384,8 @@ class Attention(nn.Module):
         use_sdpa=True,
         is_causal=False,
         qk_norm="none",
+        qk_norm_affine=True,
+        qk_temperature_max=None,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -346,8 +394,9 @@ class Attention(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
 
         norm = get_norm_layer(qk_norm)
-        self.q_norm = norm(head_dim)
-        self.k_norm = norm(head_dim)
+        self.q_norm = norm(head_dim, elementwise_affine=qk_norm_affine)
+        self.k_norm = norm(head_dim, elementwise_affine=qk_norm_affine)
+        self.qk_temperature = make_qk_temperature(qk_norm, qk_norm_affine, qk_temperature_max, num_heads)
 
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
@@ -365,7 +414,7 @@ class Attention(nn.Module):
         )
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        q = self.q_norm(q).to(v.dtype)
+        q = self.qk_temperature(self.q_norm(q)).to(v.dtype)
         k = self.k_norm(k).to(v.dtype)
 
         if self.use_sdpa:
@@ -410,6 +459,8 @@ class Block(nn.Module):
         interpolate_rope=False,
         patch_size=16,
         qk_norm="none",
+        qk_norm_affine=True,
+        qk_temperature_max=None,
         **kwargs,
     ):
         super().__init__()
@@ -431,6 +482,8 @@ class Block(nn.Module):
                 interpolate_rope=interpolate_rope,
                 patch_size=patch_size,
                 qk_norm=qk_norm,
+                qk_norm_affine=qk_norm_affine,
+                qk_temperature_max=qk_temperature_max,
             )
         else:
             self.attn = Attention(
@@ -443,6 +496,8 @@ class Block(nn.Module):
                 is_causal=is_causal,
                 proj_drop=drop,
                 qk_norm=qk_norm,
+                qk_norm_affine=qk_norm_affine,
+                qk_temperature_max=qk_temperature_max,
             )
 
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()

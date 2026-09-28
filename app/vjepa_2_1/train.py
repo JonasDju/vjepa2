@@ -16,6 +16,7 @@ import copy
 import gc
 import logging
 import random
+import re
 import time
 
 import numpy as np
@@ -23,9 +24,10 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 from app.vjepa_2_1.models.utils.masks_dist import compute_mask_distance
-from app.vjepa_2_1.models.utils.modules import Lambda_LinearWarmupHold
+from app.vjepa_2_1.models.utils.modules import Lambda_LinearWarmupHold, QKTemperature
 from app.vjepa_2_1.transforms import make_transforms
 from app.vjepa_2_1.utils import (
+    apply_optimizer_hparams,
     init_opt,
     init_video_model,
     load_checkpoint,
@@ -66,6 +68,48 @@ def compute_grad_norm(parameters, norm_type=2.0):
         norm_type,
     )
     return float(total)
+
+
+def clip_gradients(parameters, max_norm, total_norm):
+    """Rescale the gradients in place so their global L2 norm is at most ``max_norm``.
+
+    ``total_norm`` is the norm already computed by ``compute_grad_norm`` (must be finite), so
+    the gradients are not traversed twice. No-op when ``max_norm`` is ``None`` (clipping
+    disabled) or the norm is already within bounds. Returns whether the gradients were clipped.
+    """
+    if max_norm is None or total_norm <= max_norm:
+        return False
+    grads = [p for p in parameters if p.grad is not None]
+    torch.nn.utils.clip_grads_with_norm_(grads, max_norm, torch.tensor(total_norm))
+    return True
+
+
+def check_optimization_config(gradient_clipping, betas):
+    """Validate ``optimization.gradient_clipping`` / ``optimization.betas``; returns them normalised."""
+    if gradient_clipping is not None:
+        gradient_clipping = float(gradient_clipping)
+        if not gradient_clipping > 0:
+            raise ValueError(f"optimization.gradient_clipping must be null or > 0, got {gradient_clipping}")
+    betas = tuple(float(b) for b in betas)
+    if len(betas) != 2 or not all(0.0 <= b < 1.0 for b in betas):
+        raise ValueError(f"optimization.betas must be two values in [0, 1), got {betas}")
+    return gradient_clipping, betas
+
+
+def qk_temperature_summary(model):
+    """``"<block>:<max temperature>/<heads at the cap>"`` per ``QKTemperature`` in ``model``.
+
+    Returns ``None`` when the model has no QK temperatures (``model.qk_temperature_max: null``).
+    """
+    rows = []
+    for name, mod in model.named_modules():
+        if isinstance(mod, QKTemperature):
+            block = re.search(r"blocks\.(\d+)\.", name)
+            max_t = float(mod.temperature().detach().max())
+            at_cap = int((mod.log_temperature.detach() >= mod.log_max).sum())
+            rows.append(f"{block.group(1) if block else name}:{max_t:.2f}/{at_cap}")
+    return " ".join(rows) if rows else None
+
 
 _GLOBAL_SEED = 0
 random.seed(_GLOBAL_SEED)
@@ -150,6 +194,8 @@ def main(args, resume_preempt=False):
     lambda_warmup_start_iter = cfgs_model.get("lambda_warmup_start_iter", 15000)
     lambda_warmup_end_iter = cfgs_model.get("lambda_warmup_end_iter", 30000)
     qk_norm = cfgs_model.get("qk_norm", "none")
+    qk_norm_affine = cfgs_model.get("qk_norm_affine", True)
+    qk_temperature_max = cfgs_model.get("qk_temperature_max", None)
     normalize_predictor = cfgs_model.get("normalize_predictor", False)
     modality_embedding = cfgs_model.get("modality_embedding", False)
     levels_predictor = cfgs_model.get("levels_predictor", 4)
@@ -249,7 +295,10 @@ def main(args, resume_preempt=False):
     ema = cfgs_opt.get("ema")
     use_radamw = cfgs_opt.get("use_radamw", False)
     betas = cfgs_opt.get("betas", (0.9, 0.999))
-    eps = cfgs_opt.get("eps", 1.0e-8)
+    eps = float(cfgs_opt.get("eps", 1.0e-8))
+    # max global L2 norm of the encoder + predictor gradients; None disables clipping
+    gradient_clipping = cfgs_opt.get("gradient_clipping", None)
+    gradient_clipping, betas = check_optimization_config(gradient_clipping, betas)
     loss_reg_std_mult = cfgs_opt.get("loss_reg_std_mult", None)
     loss_reg_num_tracking_steps = cfgs_opt.get("loss_reg_num_tracking_steps", 300)
     loss_reg_min_epoch = cfgs_opt.get("loss_reg_min_epoch", 50)
@@ -434,6 +483,8 @@ def main(args, resume_preempt=False):
         interpolate_rope=interpolate_rope,
         modality_embedding=modality_embedding,
         qk_norm=qk_norm,
+        qk_norm_affine=qk_norm_affine,
+        qk_temperature_max=qk_temperature_max,
     )
     target_encoder = copy.deepcopy(encoder)
 
@@ -503,6 +554,7 @@ def main(args, resume_preempt=False):
     if ipe is None:
         ipe = _dlen
     logger.info(f"Using batch size of {batch_size}, fpcs of {dataset_fpcs}")
+    logger.info(f"AdamW betas={betas} eps={eps}, gradient_clipping={gradient_clipping}")
     logger.info(f"iterations per epoch/dataset length: {ipe}/{_dlen}")
 
     # zizi
@@ -569,6 +621,8 @@ def main(args, resume_preempt=False):
             scaler=scaler,
             is_anneal=is_anneal and not resume_anneal,
         )
+        # opt.load_state_dict restored the checkpoint's betas/eps; the config wins
+        apply_optimizer_hparams(optimizer, betas, eps)
         if not is_anneal or resume_anneal:
             for _ in range(start_epoch * ipe):
                 scheduler.step()
@@ -642,6 +696,7 @@ def main(args, resume_preempt=False):
 
         loss_meter = AverageMeter()
         epoch_skips = 0
+        epoch_clipped = 0
         mask_meters = {fpc: AverageMeter() for fpc in dataset_fpcs}
         iter_time_meter = AverageMeter()
         gpu_time_meter = AverageMeter()
@@ -842,6 +897,7 @@ def main(args, resume_preempt=False):
                         )
 
                 grads_finite = True
+                clipped = False
                 grad_norm = float("nan")  # stays nan when the loss regulariser skipped the step
                 if run_step:
                     if scaler is not None:
@@ -856,6 +912,9 @@ def main(args, resume_preempt=False):
                     grads_finite = bool(np.isfinite(grad_norm))
 
                     if grads_finite:
+                        # after unscale_ (true grads) and the DDP all-reduce (identical on every
+                        # rank); the logged grad_norm stays the pre-clip norm
+                        clipped = clip_gradients(enc_params + pred_params, gradient_clipping, grad_norm)
                         if scaler is not None:
                             scaler.step(optimizer)
                             scaler.update()
@@ -889,6 +948,7 @@ def main(args, resume_preempt=False):
                     "loss_context": loss_context_v,
                     "grads_finite": grads_finite,
                     "grad_norm": grad_norm,
+                    "clipped": clipped,
                 }
 
             step_out, gpu_etime_ms = gpu_timer(train_step)
@@ -900,6 +960,7 @@ def main(args, resume_preempt=False):
             iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
             loss_meter.update(loss)
 
+            epoch_clipped += int(step_out["clipped"])
             if step_out["grads_finite"]:
                 consecutive_nonfinite = 0
             else:
@@ -995,12 +1056,17 @@ def main(args, resume_preempt=False):
         # -- Save Checkpoint
         logger.info("avg. loss %.3f" % loss_meter.avg)
         logger.info(
-            "[epoch %d summary] guard-skipped=%d"
+            "[epoch %d summary] guard-skipped=%d clipped=%d"
             % (
                 epoch + 1,
                 epoch_skips,
+                epoch_clipped,
             )
         )
+        qk_temps = qk_temperature_summary(encoder)
+        if qk_temps is not None:
+            # block:max-temperature/heads-at-cap, cap = model.qk_temperature_max
+            logger.info("[epoch %d qk-temperature] %s" % (epoch + 1, qk_temps))
         if (epoch + 1) % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1):
             save_checkpoint(epoch + 1, latest_path)
             if save_every_freq > 0 and (epoch + 1) % save_every_freq == 0:

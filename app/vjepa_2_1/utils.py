@@ -106,6 +106,38 @@ def build_eval_args(
     return eval_nodes, eval_tasks_per_node, args_eval
 
 
+# state_dict key fragments whose presence depends on model.qk_norm / qk_norm_affine / qk_temperature_max
+QK_KEY_FRAGMENTS = ("q_norm.", "k_norm.", "qk_temperature.")
+
+
+def check_qk_keys_match(msg, name):
+    """Raise if a ``strict=False`` load dropped or left out any q/k-norm / temperature parameter.
+
+    ``load_checkpoint`` loads non-strictly, so resuming a run with different ``model.qk_norm*``
+    settings would otherwise silently discard the trained gains or start the temperatures from
+    scratch.
+    """
+    bad = [k for k in (*msg.missing_keys, *msg.unexpected_keys) if any(f in k for f in QK_KEY_FRAGMENTS)]
+    if bad:
+        raise ValueError(
+            f"{name}: checkpoint does not match the configured q/k norm "
+            f"(model.qk_norm / qk_norm_affine / qk_temperature_max); mismatched keys: {bad[:4]}"
+            f"{' ...' if len(bad) > 4 else ''}. Start a fresh run in a new folder instead of resuming."
+        )
+
+
+def apply_optimizer_hparams(optimizer, betas, eps):
+    """Set the configured AdamW ``betas``/``eps`` on every param group.
+
+    ``optimizer.load_state_dict`` restores the checkpoint's values, so without this a changed
+    config would be silently ignored on resume (lr/wd are fine: their schedulers overwrite them
+    every step).
+    """
+    for group in optimizer.param_groups:
+        group["betas"] = tuple(betas)
+        group["eps"] = eps
+
+
 def load_checkpoint(
     r_path,
     encoder,
@@ -132,6 +164,7 @@ def load_checkpoint(
             )
             pretrained_dict[k] = v
     msg = encoder.load_state_dict(pretrained_dict, strict=False)
+    check_qk_keys_match(msg, "encoder")
     logger.info(f"loaded pretrained encoder from epoch {epoch} with msg: {msg}")
 
     pretrained_dict = checkpoint["predictor"]
@@ -144,6 +177,7 @@ def load_checkpoint(
             )
             pretrained_dict[k] = v
     msg = predictor.load_state_dict(pretrained_dict, strict=False)
+    check_qk_keys_match(msg, "predictor")
     logger.info(f"loaded pretrained predictor from epoch {epoch} with msg: {msg}")
 
     if target_encoder is not None:
@@ -157,6 +191,7 @@ def load_checkpoint(
                 )
                 pretrained_dict[k] = v
         msg = target_encoder.load_state_dict(pretrained_dict, strict=False)
+        check_qk_keys_match(msg, "target_encoder")
         logger.info(
             f"loaded pretrained target encoder from epoch {epoch} with msg: {msg}"
         )
@@ -214,6 +249,8 @@ def init_video_model(
     interpolate_rope=False,
     modality_embedding=False,
     qk_norm="none",
+    qk_norm_affine=True,
+    qk_temperature_max=None,
 ):
     encoder = video_vit.__dict__[model_name](
         img_size=crop_size,
@@ -235,6 +272,8 @@ def init_video_model(
         interpolate_rope=interpolate_rope,
         modality_embedding=modality_embedding,
         qk_norm=qk_norm,
+        qk_norm_affine=qk_norm_affine,
+        qk_temperature_max=qk_temperature_max,
     )
     encoder = MultiSeqWrapper(encoder)
     predictor = vit_pred.__dict__["vit_predictor"](
@@ -266,6 +305,8 @@ def init_video_model(
         modality_embedding=modality_embedding,
         img_temporal_dim_size=img_temporal_dim_size,
         qk_norm=qk_norm,
+        qk_norm_affine=qk_norm_affine,
+        qk_temperature_max=qk_temperature_max,
     )
     predictor = PredictorMultiSeqWrapper(predictor)
 

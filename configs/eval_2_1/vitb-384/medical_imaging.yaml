@@ -29,6 +29,8 @@ model:
   lambda_warmup_end_iter: 15000
   qk_norm: rms                    # one of "none", "layer", "rms"
                                    # must be "none" when loading the official pretrained checkpoint
+  qk_norm_affine: false            # must match the checkpoint: false for runs trained with qk_norm_affine: false
+  qk_temperature_max: 4.0        # must match the checkpoint: e.g. 4.0 for runs trained with a QK temperature
   local_window:
   - -1
   - -1

@@ -82,6 +82,9 @@ model:
   lambda_warmup_start_iter: 7500
   lambda_warmup_end_iter: 15000
   qk_norm: rms                    # one of "none", "layer", "rms"
+  qk_norm_affine: false           # false: q/k norm without learnable gain (and without LayerNorm bias); true = old behaviour
+  qk_temperature_max: 4.0         # learnable per-head temperature (init 1), clamped to <= this -> |logit| <= 4 * sqrt(head_dim);
+                                  # needs qk_norm != none and qk_norm_affine: false. null = no temperature
   local_window:
   - -1
   - -1
@@ -119,6 +122,11 @@ optimization:
   start_lr: 0.00005
   final_lr: 0.0001
   lr: 0.0001
+  gradient_clipping: 1.0          # max global L2 norm of the encoder + predictor gradients; null = no clipping
+  betas:                          # AdamW (beta_1, beta_2); the old default was [0.9, 0.999]
+  - 0.9
+  - 0.95
+  eps: 1.0e-8
 
 # KneeNo classification evaluation, run on the frozen (target) encoder every
 # eval.freq.<task> epochs -- see KneeNo/kneeno/evaluation/config.py for every

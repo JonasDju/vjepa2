@@ -100,6 +100,8 @@ def build_encoder(cfgs_data, cfgs_model, in_chans, max_num_frames, device):
         interpolate_rope=cfgs_model.get("interpolate_rope", False),
         modality_embedding=cfgs_model.get("modality_embedding", False),
         qk_norm=cfgs_model.get("qk_norm", "none"),
+        qk_norm_affine=cfgs_model.get("qk_norm_affine", False),
+        qk_temperature_max=cfgs_model.get("qk_temperature_max", 4.0),
     )
     return encoder
 

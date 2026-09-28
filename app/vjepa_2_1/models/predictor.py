@@ -16,6 +16,21 @@ from src.utils.tensors import repeat_interleave_batch, trunc_normal_
 from app.vjepa_2_1.models.utils.modules import Block
 
 
+def reorder_tokens(x, order):
+    """Per-sample reordering along dim 1: ``out[i, j] = x[i, order[i, j]]``.
+
+    ``x`` is [B, N] (mask indices) or [B, N, D] (tokens), ``order`` is [B, N]. Replaces the
+    upstream ``torch.stack([x[i, row] for i, row in enumerate(order)])``, which torch.compile
+    unrolls into one gather per sample and stacks -- with dynamic token counts that stack hit
+    an Inductor ``CantSplit`` crash on the predictor's first recompile. ``torch.gather`` is a
+    pure copy, and ``order`` is a permutation (no repeated index), so forward and backward are
+    bit-identical to the loop (tests/vjepa_2_1/test_predictor_reorder.py).
+    """
+    if x.dim() == 3:
+        order = order.unsqueeze(-1).expand(-1, -1, x.size(-1))
+    return torch.gather(x, 1, order)
+
+
 class VisionTransformerPredictor(nn.Module):
     """Vision Transformer Predictor"""
 
@@ -261,8 +276,8 @@ class VisionTransformerPredictor(nn.Module):
         masks = torch.cat([masks_x, masks_y], dim=1)
 
         argsort = torch.argsort(masks, dim=1)
-        masks = torch.stack([masks[i, row] for i, row in enumerate(argsort)], dim=0)
-        x = torch.stack([x[i, row, :] for i, row in enumerate(argsort)], dim=0)
+        masks = reorder_tokens(masks, argsort)
+        x = reorder_tokens(x, argsort)
 
         if self.chop_last_n_tokens > 0:
             x = x[:, : -self.chop_last_n_tokens]
@@ -285,17 +300,13 @@ class VisionTransformerPredictor(nn.Module):
 
         if not self.return_all_tokens:
             reverse_argsort = torch.argsort(argsort, dim=1)
-            x = torch.stack(
-                [x[i, row, :] for i, row in enumerate(reverse_argsort)], dim=0
-            )
+            x = reorder_tokens(x, reverse_argsort)
             x = x[:, N_ctxt:, :]
             x = self.predictor_proj(x)
             return x, None
         else:
             reverse_argsort = torch.argsort(argsort, dim=1)
-            x = torch.stack(
-                [x[i, row, :] for i, row in enumerate(reverse_argsort)], dim=0
-            )
+            x = reorder_tokens(x, reverse_argsort)
             x_pred = x[:, N_ctxt:, :]
             x_context = x[:, :N_ctxt, :]
             x_pred = self.predictor_proj(x_pred)

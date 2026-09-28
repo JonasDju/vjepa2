@@ -22,8 +22,10 @@ otherwise give up on; the generated kernels compute the same thing.
 """
 
 import logging
+import os
 
 import sympy
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -67,3 +69,23 @@ def patch_inductor_multiple_of():
     SizeVarAllocator.statically_known_multiple_of = statically_known_multiple_of
     logger.info("Inductor statically_known_multiple_of: installed exact sympy.cancel fallback (CantSplit workaround)")
     return True
+
+
+def compile_models(encoder, target_encoder, predictor, activation_memory_budget=None, rank=0):
+    """``compile_model: true`` as train.py does it -- shared with tests/vjepa_2_1/test_compile_equivalence_cuda.py
+    so the test compiles exactly what training compiles.
+
+    ``activation_memory_budget`` (None = leave PyTorch's default) is only applied without activation
+    checkpointing; the caller decides. ``VJEPA_DEBUG_CANTSPLIT`` installs the diagnostic logger.
+    """
+    torch._dynamo.config.optimize_ddp = False
+    patch_inductor_multiple_of()  # Inductor CantSplit on the predictor's n_ctxt + n_pred token axis
+    if os.environ.get("VJEPA_DEBUG_CANTSPLIT"):
+        from app.vjepa_2_1.compile_debug import install_cantsplit_logger
+
+        install_cantsplit_logger(rank)
+    encoder.compile()
+    target_encoder.compile()
+    predictor.compile()
+    if activation_memory_budget is not None:
+        torch._functorch.config.activation_memory_budget = activation_memory_budget

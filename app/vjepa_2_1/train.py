@@ -23,8 +23,7 @@ import numpy as np
 import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
-from app.vjepa_2_1.compile_debug import install_cantsplit_logger
-from app.vjepa_2_1.compile_fixes import patch_inductor_multiple_of
+from app.vjepa_2_1.compile_fixes import compile_models
 from app.vjepa_2_1.models.utils.masks_dist import compute_mask_distance
 from app.vjepa_2_1.models.utils.modules import Lambda_LinearWarmupHold, QKTemperature
 from app.vjepa_2_1.transforms import make_transforms
@@ -492,15 +491,13 @@ def main(args, resume_preempt=False):
 
     if compile_model:
         logger.info("Compiling encoder, target_encoder, and predictor.")
-        torch._dynamo.config.optimize_ddp = False
-        patch_inductor_multiple_of()  # Inductor CantSplit on the predictor's n_ctxt + n_pred token axis
-        if os.environ.get("VJEPA_DEBUG_CANTSPLIT"):
-            install_cantsplit_logger(rank)
-        encoder.compile()
-        target_encoder.compile()
-        predictor.compile()
-        if not use_activation_checkpointing:
-            torch._functorch.config.activation_memory_budget = activation_memory_budget
+        compile_models(
+            encoder,
+            target_encoder,
+            predictor,
+            activation_memory_budget=None if use_activation_checkpointing else activation_memory_budget,
+            rank=rank,
+        )
 
     mask_collator = MaskCollator(
         cfgs_mask=cfgs_mask,

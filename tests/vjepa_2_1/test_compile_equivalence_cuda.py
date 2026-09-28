@@ -19,6 +19,8 @@ Environment (all optional):
     VJEPA_COMPILE_TEST_STRICT_REF_CHUNK  samples per chunk of its float64 reference (default 1: float64 attention
                                    has no memory-efficient kernel, ~30 GB per sample at 256 px x 24 slices)
     VJEPA_COMPILE_TEST_REF_CHUNK   samples per chunk of the fp32 reference of the training-setting check (default 8)
+    VJEPA_COMPILE_TEST_EAGER_CHUNK samples per chunk of its eager run (default: full batch, halved on CUDA OOM --
+                                   the eager model needs ~1.6x the memory of training's graph-break setup)
 
 What is compared. The same batch (same volumes, same masks) goes through the uncompiled ("eager") and the
 compiled model, built and compiled exactly as train.py does it (``init_video_model`` with the config's
@@ -45,7 +47,8 @@ above that. Two checks:
    ``activation_memory_budget``, TF32 as in training. The reference is the eager model in float32 (TF32
    off), run in chunks of VJEPA_COMPILE_TEST_REF_CHUNK samples with losses / gradients averaged: every loss
    term is a mean over batch x tokens and samples never interact, so that is exactly the full-batch math at
-   a fraction of the memory.
+   a fraction of the memory. The compiled model always runs the full batch; the eager run (only the noise
+   yardstick) falls back to chunks if the uncompiled model does not fit at that batch size.
 
 The loss mirrors ``train_step`` in app/vjepa_2_1/train.py (forward_target / forward_context / loss_fn,
 context loss weighted by ``lambda_value_vid`` -- the warmup's final value, so the context-loss gradients
@@ -463,6 +466,25 @@ def free_cuda():
         torch.cuda.empty_cache()
 
 
+def run_steps_fitting(s, models, steps, device, chunk=None, **kw):
+    """``run_steps`` with ``chunk`` samples per chunk (None = full batch); on CUDA OOM retry with half the chunk."""
+    size = chunk or steps[0][0][0].shape[0]
+    while True:
+        try:
+            print(f"    batch chunk {size}", flush=True)
+            return run_steps(s, models, steps, device, chunk=size, **kw)
+        except torch.OutOfMemoryError as e:
+            if size % 2 or size <= 1:
+                raise
+            traceback.clear_frames(e.__traceback__)
+            del e
+            for module in models:
+                module.zero_grad(set_to_none=True)
+            free_cuda()
+            size //= 2
+            print(f"    CUDA OOM -> retrying with batch chunk {size}", flush=True)
+
+
 def phase(name, fn):
     """Run one phase with its time and peak GPU memory printed; frees the cache afterwards."""
     torch.cuda.reset_peak_memory_stats()
@@ -543,7 +565,11 @@ class CompileEquivalenceCudaTest(unittest.TestCase):
         ref_chunk = env_int("VJEPA_COMPILE_TEST_REF_CHUNK", 8)
         reference = phase("reference (float32)", lambda: run_steps(s, self.base, steps, dev, chunk=ref_chunk))
         torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = self._tf32  # training defaults
-        eager = phase(f"eager ({s.dtype})", lambda: run_steps(s, self.base, steps, dev, autocast_dtype=autocast))
+        eager_chunk = env_int("VJEPA_COMPILE_TEST_EAGER_CHUNK", 0) or None
+        eager = phase(
+            f"eager ({s.dtype})",
+            lambda: run_steps_fitting(s, self.base, steps, dev, chunk=eager_chunk, autocast_dtype=autocast),
+        )
         budget = None if s.use_activation_checkpointing else s.activation_memory_budget
         compiled = phase(
             f"compiled ({s.dtype})",

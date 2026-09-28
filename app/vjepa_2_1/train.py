@@ -23,6 +23,7 @@ import numpy as np
 import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
+from app.vjepa_2_1.compile_fixes import compile_models
 from app.vjepa_2_1.models.utils.masks_dist import compute_mask_distance
 from app.vjepa_2_1.models.utils.modules import Lambda_LinearWarmupHold, QKTemperature
 from app.vjepa_2_1.transforms import make_transforms
@@ -193,9 +194,11 @@ def main(args, resume_preempt=False):
     lambda_progressive = cfgs_model.get("lambda_progressive", True)
     lambda_warmup_start_iter = cfgs_model.get("lambda_warmup_start_iter", 15000)
     lambda_warmup_end_iter = cfgs_model.get("lambda_warmup_end_iter", 30000)
-    qk_norm = cfgs_model.get("qk_norm", "none")
-    qk_norm_affine = cfgs_model.get("qk_norm_affine", True)
-    qk_temperature_max = cfgs_model.get("qk_temperature_max", None)
+    qk_norm = cfgs_model.get("qk_norm", "rms")
+    # defaults = the bounded-QK recipe (as in eval_classification.py); a config without a q/k norm must set
+    # qk_temperature_max: null, the old behaviour is qk_norm_affine: true + qk_temperature_max: null
+    qk_norm_affine = cfgs_model.get("qk_norm_affine", False)
+    qk_temperature_max = cfgs_model.get("qk_temperature_max", 4.0)
     normalize_predictor = cfgs_model.get("normalize_predictor", False)
     modality_embedding = cfgs_model.get("modality_embedding", False)
     levels_predictor = cfgs_model.get("levels_predictor", 4)
@@ -490,12 +493,12 @@ def main(args, resume_preempt=False):
 
     if compile_model:
         logger.info("Compiling encoder, target_encoder, and predictor.")
-        torch._dynamo.config.optimize_ddp = False
-        encoder.compile()
-        target_encoder.compile()
-        predictor.compile()
-        if not use_activation_checkpointing:
-            torch._functorch.config.activation_memory_budget = activation_memory_budget
+        compile_models(
+            encoder,
+            target_encoder,
+            predictor,
+            activation_memory_budget=None if use_activation_checkpointing else activation_memory_budget,
+        )
 
     mask_collator = MaskCollator(
         cfgs_mask=cfgs_mask,

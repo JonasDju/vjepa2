@@ -24,6 +24,10 @@ from tests.vjepa_2_1.labeled_fixture import INTERNAL_SEQUENCES, full_exam_spec, 
 from tests.vjepa_2_1.test_kneeno_adapter import CROP_SIZE, NUM_FRAMES, PATCH_SIZE, TUBELET_SIZE
 
 H, W = 20, 24
+# eval_classification.py's defaults for the q/k options (the bounded-QK training recipe): the checkpoints below
+# are built with them and the configs omit both keys, so the tests exercise the defaults
+QK_NORM_AFFINE = False
+QK_TEMPERATURE_MAX = 4.0
 # labeled (evaluation) data: two series of different depth per patient -> resampled to NUM_FRAMES
 SPEC = full_exam_spec(10, INTERNAL_SEQUENCES)  # 10 complete exams
 
@@ -58,6 +62,9 @@ class EvalClassificationCliTest(unittest.TestCase):
             use_rope=True,
             modality_embedding=True,
             qk_norm=qk_norm,
+            qk_norm_affine=QK_NORM_AFFINE,
+            # the temperature needs a q/k norm; official checkpoints (qk_norm "none") have neither
+            qk_temperature_max=None if qk_norm == "none" else QK_TEMPERATURE_MAX,
         )
         # train.py saves the DDP-wrapped modules, so every key carries a "module." prefix
         ddp_state = {f"module.{k}": v for k, v in encoder.state_dict().items()}
@@ -127,6 +134,10 @@ class EvalClassificationCliTest(unittest.TestCase):
         }
         if n_channels is not None:
             config["model"]["n_channels"] = n_channels
+        if qk_norm == "none":
+            # the default qk_temperature_max (4.0) requires a q/k norm, so a config for a checkpoint without one
+            # (e.g. the official ones) must disable it explicitly
+            config["model"]["qk_temperature_max"] = None
         self.config_path = self.root / "config.yaml"
         self.config_path.write_text(yaml.dump(config))
 
@@ -148,7 +159,9 @@ class EvalClassificationCliTest(unittest.TestCase):
     def test_loads_every_weight_of_a_ddp_checkpoint(self):
         # Regression: the "module." prefix of train.py's DDP checkpoints and the config's qk_norm
         # were both dropped once, and load_state_dict(strict=False) skipped the unmatched weights
-        # silently -- the script evaluated a randomly initialised encoder.
+        # silently -- the script evaluated a randomly initialised encoder. With the default
+        # qk_norm_affine: false the q/k norms have no weights; the per-head temperature (which
+        # only exists with a q/k norm) shows that the q/k options reached the model.
         from app.vjepa_2_1.eval_classification import build_encoder, load_frozen_encoder
 
         self._make_datasets(SPEC)
@@ -160,7 +173,7 @@ class EvalClassificationCliTest(unittest.TestCase):
         saved = torch.load(self.checkpoint_path, map_location="cpu")["target_encoder"]
         loaded = encoder.state_dict()
         self.assertEqual({f"module.{k}" for k in loaded}, set(saved))
-        self.assertTrue(any(".q_norm." in k for k in loaded))
+        self.assertTrue(any(".qk_temperature." in k for k in loaded))
         for k, v in loaded.items():
             self.assertTrue(torch.equal(v, saved[f"module.{k}"]), k)
 

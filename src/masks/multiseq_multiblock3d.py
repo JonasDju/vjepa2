@@ -43,6 +43,7 @@ class MaskCollator(object):
                     full_complement=m.get("full_complement", False),
                     pred_full_complement=m.get("pred_full_complement", False),
                     inv_block=m.get("inv_block", False),
+                    random_truncation=m.get("random_truncation", False),
                 )
                 self.mask_generators[fpc].append(mask_generator)
 
@@ -107,6 +108,7 @@ class _MaskGenerator(object):
         inv_block=False,
         full_complement=False,
         pred_full_complement=False,
+        random_truncation=False,
     ):
         super(_MaskGenerator, self).__init__()
         if not isinstance(crop_size, tuple):
@@ -134,6 +136,8 @@ class _MaskGenerator(object):
         self.max_keep = max_keep  # maximum number of patches to keep in context
         self._itr_counter = Value("i", -1)  # collator is shared across worker processes
         self.inv_block = inv_block
+        # How each sample's context / target indices are cut to the batch minimum (see _truncate)
+        self.random_truncation = random_truncation
 
     def step(self):
         i = self._itr_counter
@@ -169,6 +173,21 @@ class _MaskGenerator(object):
         w = min(w, self.width)
 
         return (t, h, w)
+
+    def _truncate(self, indices, keep):
+        """Cut one sample's sorted token indices to ``keep`` entries, so a batch's masks can be stacked.
+
+        The default (upstream) keeps the first ``keep`` indices. The indices are sorted in
+        (depth, height, width) order, so that always drops the tokens of the *last* depth positions:
+        with 24-slice MRI volumes and a per-GPU batch of 48, the long-range tube mask then drew its
+        context almost only from the first ~8 slices. ``random_truncation`` keeps a uniformly random
+        subset instead (drawn from the global torch generator, like the block positions), sorted
+        again so the output has the same order as before.
+        """
+        if not self.random_truncation or len(indices) <= keep:
+            return indices[:keep]
+        kept = indices[torch.randperm(len(indices))[:keep]]
+        return kept.sort().values
 
     def _sample_block_mask(self, b_size):
         t, h, w = b_size
@@ -231,8 +250,8 @@ class _MaskGenerator(object):
         if self.max_keep is not None:
             min_keep_enc = min(min_keep_enc, self.max_keep)
 
-        collated_masks_enc = [cm[:min_keep_enc] for cm in collated_masks_enc]
-        collated_masks_pred = [cm[:min_keep_pred] for cm in collated_masks_pred]
+        collated_masks_enc = [self._truncate(cm, min_keep_enc) for cm in collated_masks_enc]
+        collated_masks_pred = [self._truncate(cm, min_keep_pred) for cm in collated_masks_pred]
         if self.full_complement:  # predictor mask is just complement of encoder mask
             collated_masks_pred = [
                 torch.tensor(

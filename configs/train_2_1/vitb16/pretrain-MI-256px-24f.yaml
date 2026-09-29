@@ -40,6 +40,8 @@ mask:
   - 1.5
   full_complement: false
   max_keep: null
+  random_truncation: true  # cut each sample's context/target indices to the batch minimum with a random subset
+                           # instead of the first ones (false = upstream: always drops the last slices)
   max_temporal_keep: 1.0
   num_blocks: 8
   spatial_scale:
@@ -53,6 +55,7 @@ mask:
   - 1.5
   full_complement: false
   max_keep: null
+  random_truncation: true
   max_temporal_keep: 1.0
   num_blocks: 2
   spatial_scale:

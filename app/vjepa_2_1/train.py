@@ -606,7 +606,7 @@ def main(args, resume_preempt=False):
 
     start_epoch = 0
     # -- load training checkpoint
-    print("Loadind checkpoint from: ", load_path)
+    print("Loading checkpoint from: ", load_path)
     if load_model or os.path.exists(latest_path):
         (
             encoder,

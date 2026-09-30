@@ -1,17 +1,17 @@
 app: vjepa_2_1
-nodes: 8
+nodes: 16
 tasks_per_node: 8
-cpus_per_task: 8
+cpus_per_task: 16
 mem_per_gpu: 220G
-folder: /hpcwork/va105917/vjepa/pretrain_2_1/${SLURM_JOB_ID}.16p.24d.vitb.256px
+folder: /hpcwork/va105917/vjepa/cooldown_2_1/${SLURM_JOB_ID}.16p.24d.vitb.384px
 data:
   dataset_type: MIDataset
   data_root: /dev/shm/kneeno_data/unlabeled
   data_meta: /hpcwork/p0021834/workspace_roman/jonas/BigKneeTar/metadata_unlabeled.json
   series_depth: 24
   resample_mode: nearest  # only used when series_depth > 0: "nearest" or "interpolate"
-  batch_size: 48
-  crop_size: 256
+  batch_size: 24
+  crop_size: 384
   patch_size: 16
   tubelet_size: 2
   num_workers: 8
@@ -28,12 +28,14 @@ data_aug:
   - 1.0
   reprob: 0.0
 loss:
+  computing_gram_loss: false
+  gram_HighRes: false
+  gram_ckpt: None
+  gram_loss_weight: 10.0
   loss_exp: 1.0
   predict_all: true
-  reg_coeff: 0.0
   shift_by_n: 0
-  weight_distance_loss: true
-
+  weight_distance_loss: false
 mask:
 - aspect_ratio:
   - 0.75
@@ -81,60 +83,41 @@ model:
   is_causal: false
   lambda_value_img: 0.5
   lambda_value_vid: 0.5
-  lambda_progressive: true
-  lambda_warmup_start_iter: 7500
-  lambda_warmup_end_iter: 15000
+  lambda_progressive: false
+  modality_embedding: true
   qk_norm: rms                    # one of "none", "layer", "rms"
   qk_norm_affine: false           # false: q/k norm without learnable gain (and without LayerNorm bias); true = old behaviour
   qk_temperature_max: 4.0         # learnable per-head temperature (init 1), clamped to <= this -> |logit| <= 4 * sqrt(head_dim);
                                   # needs qk_norm != none and qk_norm_affine: false. null = no temperature
-  local_window:
-  - -1
-  - -1
-  - -1
-  modality_embedding: true
   model_name: vit_base
   n_registers: 0
-  n_registers_predictor: 0
   normalize_predictor: false
   pred_depth: 12
   pred_embed_dim: 384
   pred_is_causal: false
-  pred_local_window:
-  - -1
-  - -1
-  - -1
   pred_num_heads: 12
   uniform_power: true
   use_mask_tokens: true
   use_rope: true
-  vit_conv: false
   zero_init_mask_tokens: true
 optimization:
+  anneal_ckpt: /hpcwork/va105917/vjepa/pretrain_2_1/<MODEL_DIR>/latest.pth.tar
   ema:
   - 0.99925
   - 0.99925
-  epochs: 300
-  warmup: 10
+  epochs: 40
+  warmup: 0
   ipe: 300
   ipe_scale: 1.25
   weight_decay: 0.04
   final_weight_decay: 0.04
-  # Safe lr for global batch size 48: 1e-4 or 2e-4
-  # Use sqrt scaling for multi GPU training
-  start_lr: 0.000075
-  final_lr: 0.00015
   lr: 0.00015
-  gradient_clipping: 1.0          # max global L2 norm of the encoder + predictor gradients; null = no clipping
-  betas:                          # AdamW (beta_1, beta_2); the old default was [0.9, 0.999]
-  - 0.9
-  - 0.95
-  eps: 1.0e-8
+  start_lr: 0.00015
+  final_lr: 2.5e-07
+  is_anneal: true
+  resume_anneal: true
 
-# KneeNo classification evaluation, run on the frozen (target) encoder every
-# eval.freq.<task> epochs -- see KneeNo/kneeno/evaluation/config.py for every
-# key. "linear" is explicitly disabled below: V-JEPA 2.1 has no cls token
-# (VJepa21Adapter.has_cls_token = False)
+
 eval:
   seed: 239
   encoder: target  # target (EMA) | online
@@ -153,8 +136,8 @@ eval:
     multiprocessing_context: fork  # eval DataLoader worker start method; null -> inherit. Workers must never touch CUDA
     persistent_workers: true  # keep workers alive across head epochs (ignored when num_workers = 0)
   logging:
-    tensorboard_dir: /hpcwork/va105917/vjepa/pretrain_2_1/${SLURM_JOB_ID}.16p.24d.vitb.256px/eval/in-training/tb
-    per_label_dir: /hpcwork/va105917/vjepa/pretrain_2_1/${SLURM_JOB_ID}.16p.24d.vitb.256px/eval/in-training/eval_per_label
+    tensorboard_dir: /hpcwork/va105917/vjepa/cooldown_2_1/${SLURM_JOB_ID}.16p.24d.vitb.384px/eval/in-training/tb
+    per_label_dir: /hpcwork/va105917/vjepa/cooldown_2_1/${SLURM_JOB_ID}.16p.24d.vitb.384px/eval/in-training/eval_per_label
     tag_prefix: eval
   freq:
     knn: 10

@@ -1538,7 +1538,7 @@ dependencies = [
 requires-dist = [
     { name = "matplotlib", specifier = ">=3.6" },
     { name = "numpy" },
-    { name = "pandas", specifier = ">=3.0.6" },
+    { name = "pandas", specifier = ">=3.0" },
     { name = "pillow", specifier = ">=10.3.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "simpleitk", specifier = ">=2.5.6" },

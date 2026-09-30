@@ -29,6 +29,7 @@ The official (RGB-pretrained) V-JEPA 2.1 checkpoints load the same way, as a bas
 
 import argparse
 import pprint
+from pathlib import Path
 
 import torch
 import yaml
@@ -144,6 +145,24 @@ def main():
     cfgs_eval = config.get("eval")
     if cfgs_eval is None:
         raise ValueError(f"{args.fname} has no 'eval:' block")
+
+    # Abort if evaluation results already exist
+    label_dir = cfgs_eval.get("logging").get("per_label_dir")
+    tb_dir = cfgs_eval.get("logging").get("tensorboard_dir")
+
+    if (label_dir is not None and Path(label_dir).exists() or
+        tb_dir is not None and Path(tb_dir).exists()):
+        raise ValueError(f"Evaluation results already exist on the given path (eval.logging.tensorboard_dir or eval.logging.per_label_dir).")
+
+    if label_dir is not None:
+        label_dir_path = Path(label_dir)
+        label_dir_path.mkdir(parents=True, exist_ok=True)
+
+        with open(label_dir_path / "params.yaml", "w") as f:
+            yaml.dump(config, f)
+
+    else:
+        logger.warning("per_label_dir not specified in evaluation config. Skipping saving evaluation params to disk.")
 
     cfgs_model = config["model"]
     cfgs_data = config["data"]

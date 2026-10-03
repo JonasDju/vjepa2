@@ -27,6 +27,12 @@ The official (RGB-pretrained) V-JEPA 2.1 checkpoints load the same way, as a bas
 ``vjepa2_1_vitb_dist_vitG_384.pt``; ``--encoder target`` picks its ``ema_encoder``.
 """
 
+import os
+
+# Expandable segments let freed memory be reused for any size. setdefault, so an explicit setting in the job
+# environment wins.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
 import pprint
 from pathlib import Path

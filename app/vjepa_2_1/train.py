@@ -263,6 +263,7 @@ def main(args, resume_preempt=False):
 
     # -- DATA AUGS
     cfgs_data_aug = args.get("data_aug")
+    random_horizontal_flip = cfgs_data_aug.get("random_horizontal_flip", True)
     ar_range = cfgs_data_aug.get("random_resize_aspect_ratio", [3 / 4, 4 / 3])
     rr_scale = cfgs_data_aug.get("random_resize_scale", [0.3, 1.0])
     motion_shift = cfgs_data_aug.get("motion_shift", False)
@@ -514,7 +515,7 @@ def main(args, resume_preempt=False):
     else:
         normalize = NORMALIZE_RGB
     transform = make_transforms(
-        random_horizontal_flip=True,
+        random_horizontal_flip=random_horizontal_flip,
         random_resize_aspect_ratio=ar_range,
         random_resize_scale=rr_scale,
         reprob=reprob,

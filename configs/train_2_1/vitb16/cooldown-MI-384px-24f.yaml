@@ -18,6 +18,7 @@ data:
   persistent_workers: true
   pin_mem: true
 data_aug:
+  random_horizontal_flip: true
   auto_augment: false
   motion_shift: false
   random_resize_aspect_ratio:

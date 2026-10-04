@@ -1,6 +1,6 @@
 """Synthetic labeled datasets in the real KneeNo layouts.
 
-* :func:`make_labeled_dataset` -- NIfTI volumes + ``extract_labeled_meta.py`` JSON, read by
+* :func:`make_labeled_dataset` -- NIfTI volumes + ``merge_labels_into_unlabeled_meta.py`` JSON, read by
   ``LabeledExternalKneeMRIDataset``.
 * :func:`make_internal_labeled_dataset` -- JPEG slices + ``merge_clinical_labels_into_unlabeled_meta.py``
   JSON, read by ``LabeledInternalKneeMRIDataset`` (the dataset ``ClassificationEvaluator`` builds
@@ -21,40 +21,44 @@ NUM_CLASSES = 3
 
 # Orientation each series' NIfTI is stored in (matches LabeledExternalKneeMRIDataset.TARGET_ORIENTATION's sources).
 SOURCE_ORIENTATION = {
-    "SAGITTAL_PROTON": "ASL",
-    "SAGITTAL_T1": "ASL",
-    "CORONAL_PROTON": "LSA",
-    "TRANSVERSAL_PROTON": "LAS",
+    "sag": "ASL",
+    "sagt1": "ASL",
+    "cor": "LSA",
+    "ax": "LAS",
 }
 
 # The labeled datasets only keep exams with all four sequences (their ``SEQUENCES``, in this order).
-EXTERNAL_SEQUENCES = ("SAGITTAL_PROTON", "SAGITTAL_T1", "CORONAL_PROTON", "TRANSVERSAL_PROTON")
+EXTERNAL_SEQUENCES = ("sag", "sagt1", "cor", "ax")
 INTERNAL_SEQUENCES = ("sag", "st1", "cor", "tra")
 
 
 def full_exam_spec(n_exams, sequences, depths=(6, 5, 4, 7)):
-    """``{uid: {series_name: depth}}`` for ``n_exams`` complete exams."""
+    """``{case_id: {series_name: depth}}`` for ``n_exams`` complete exams."""
     return {f"c{i}": dict(zip(sequences, depths)) for i in range(n_exams)}
 
 
 def make_labeled_dataset(root, spec, h, w, num_classes=NUM_CLASSES, seed=0):
-    """Write ``root/<uid>/<series>.nii.gz`` and ``root/metadata.json``; return the metadata path.
+    """Write ``root/<case_id>/<series>.nii.gz`` and ``root/metadata.json``; return the metadata path.
 
-    :param spec: ``{uid: {series_name: depth}}`` with series names from ``SOURCE_ORIENTATION``.
+    The metadata is ``{"label_names": [...], "cases": {case_id: {series: {"dimensions": [H, W, D], ...},
+    ..., "labels": [...]}}}``, as ``merge_labels_into_unlabeled_meta.py`` writes it.
+
+    :param spec: ``{case_id: {series_name: depth}}`` with series names from ``SOURCE_ORIENTATION``.
     """
     rng = np.random.default_rng(seed)
-    meta = {}
-    for uid, series in spec.items():
-        meta[uid] = {}
+    cases = {}
+    for case_id, series in spec.items():
+        cases[case_id] = {}
         for name, depth in series.items():
             array = (rng.random((depth, h, w)) * 1000 + 1).astype(np.float32)
             image = sitk.GetImageFromArray(array)
             image.SetDirection(sitk.DICOMOrientImageFilter().GetDirectionCosinesFromOrientation(SOURCE_ORIENTATION[name]))
-            path = Path(root) / uid / f"{name}.nii.gz"
+            path = Path(root) / case_id / f"{name}.nii.gz"
             path.parent.mkdir(parents=True, exist_ok=True)
             sitk.WriteImage(image, str(path))
-            meta[uid][name] = {"dimensions": [h, w, depth], "data_resolution": [0.3, 0.3, 3.0]}
-        meta[uid]["labels"] = [int(v) for v in rng.integers(0, 2, size=num_classes)]
+            cases[case_id][name] = {"dimensions": [h, w, depth], "data_resolution": [0.3, 0.3, 3.0]}
+        cases[case_id]["labels"] = [int(v) for v in rng.integers(0, 2, size=num_classes)]
+    meta = {"label_names": [f"label_{i}" for i in range(num_classes)], "cases": cases}
     meta_path = Path(root) / "metadata.json"
     meta_path.write_text(json.dumps(meta))
     return str(meta_path)

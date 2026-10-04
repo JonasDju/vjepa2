@@ -188,7 +188,10 @@ def main():
     encoder = load_frozen_encoder(args.checkpoint, encoder, ENCODER_STATE_DICT_KEYS[encoder_choice])
     encoder.to(device)
 
+    dataset_type = cfgs_eval.get("data").get("dataset_type")
+
     adapter = VJepa21Adapter(
+        dataset_type=dataset_type,
         embed_dim=encoder.embed_dim,
         n_channels=in_chans,
         crop_size=cfgs_data.get("crop_size", 224),

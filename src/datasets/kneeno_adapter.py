@@ -16,9 +16,13 @@ from logging import getLogger
 
 import torch
 import torch.nn.functional as F
+from kneeno import LabeledExternalKneeMRIDataset
 from kneeno.evaluation.adapter import EncoderAdapter
 
 logger = getLogger()
+
+#: ``eval.data.dataset_type`` values; ``"external"`` volumes are first quantized like the internal JPEGs.
+DATASET_TYPES = ("internal", "external")
 
 
 class VJepa21Adapter(EncoderAdapter):
@@ -32,7 +36,11 @@ class VJepa21Adapter(EncoderAdapter):
 
     has_cls_token = False
 
-    def __init__(self, embed_dim, n_channels=1, crop_size=256, normalize=((0.5,), (0.5,))):
+    def __init__(self, dataset_type, embed_dim, n_channels=1, crop_size=256, normalize=((0.5,), (0.5,))):
+        # anything else would silently take the internal path, i.e. treat raw NIfTI intensities as 0..255
+        if dataset_type not in DATASET_TYPES:
+            raise ValueError(f"dataset_type must be one of {DATASET_TYPES}, got {dataset_type!r}")
+        self.dataset_type = dataset_type
         self._embed_dim = embed_dim
         self.n_channels = n_channels
         self.crop_size = crop_size
@@ -53,7 +61,8 @@ class VJepa21Adapter(EncoderAdapter):
         return self._embed_dim
 
     def prepare_input(self, volume, orientation=None):
-        """``(1, D, H, W)`` raw volume -> ``(C, D, crop_size, crop_size)`` float32.
+        """``(1, D, H, W)`` raw volume (in [0, 255] for internal / unscaled for external)
+                        -> ``(C, D, crop_size, crop_size)`` float32.
 
         Deterministic resize (shorter side -> ``crop_size``) + center crop, then
         normalize -- the eval-time counterpart of ``VideoTransform``'s random
@@ -68,6 +77,10 @@ class VJepa21Adapter(EncoderAdapter):
         ``orientation`` is ignored: pretraining feeds the volumes in the orientation they are stored in,
         so evaluation keeps them in the orientation the labeled dataset returns.
         """
+        if self.dataset_type == "external":
+            # Process volume to mimic the internal dataset. Then, proceed as before.
+            volume = LabeledExternalKneeMRIDataset.to_uint8(volume)
+
         if not torch.is_tensor(volume):
             volume = torch.as_tensor(volume)
         buffer = volume.float()  # (1, D, H, W) == (C, D, H, W), C=1

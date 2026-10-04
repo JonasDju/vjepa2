@@ -15,12 +15,20 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import torch
 import yaml
 
 from app.vjepa_2_1.utils import init_video_model
-from tests.vjepa_2_1.labeled_fixture import INTERNAL_SEQUENCES, full_exam_spec, make_internal_labeled_dataset
+from src.datasets.kneeno_adapter import VJepa21Adapter
+from tests.vjepa_2_1.labeled_fixture import (
+    EXTERNAL_SEQUENCES,
+    INTERNAL_SEQUENCES,
+    full_exam_spec,
+    make_internal_labeled_dataset,
+    make_labeled_dataset,
+)
 from tests.vjepa_2_1.test_kneeno_adapter import CROP_SIZE, NUM_FRAMES, PATCH_SIZE, TUBELET_SIZE
 
 H, W = 20, 24
@@ -30,6 +38,7 @@ QK_NORM_AFFINE = False
 QK_TEMPERATURE_MAX = 4.0
 # labeled (evaluation) data: two series of different depth per patient -> resampled to NUM_FRAMES
 SPEC = full_exam_spec(10, INTERNAL_SEQUENCES)  # 10 complete exams
+EXTERNAL_SPEC = full_exam_spec(10, EXTERNAL_SEQUENCES)
 
 
 class EvalClassificationCliTest(unittest.TestCase):
@@ -39,14 +48,15 @@ class EvalClassificationCliTest(unittest.TestCase):
         self.root = Path(self._tmp.name)
         self._make_checkpoint()
 
-    def _make_datasets(self, labeled_spec):
+    def _make_datasets(self, labeled_spec, dataset_type="internal"):
         """Labeled data for the eval block (the script never loads pretraining volumes).
 
-        The labeled data is in the internal (JPEG + ``"cases"``) layout, because the script lets
-        ``ClassificationEvaluator`` build its own dataset, which is a ``LabeledInternalKneeMRIDataset``.
+        The script lets ``ClassificationEvaluator`` build its own dataset, so the layout must match
+        ``eval.data.dataset_type`` (see ``_make_config``): JPEG slices for ``"internal"``, NIfTI for ``"external"``.
         """
-        self.labeled_root = self.root / "labeled"
-        self.labeled_meta_path = Path(make_internal_labeled_dataset(self.labeled_root, labeled_spec, h=H, w=W))
+        self.labeled_root = self.root / f"labeled_{dataset_type}"
+        make = make_internal_labeled_dataset if dataset_type == "internal" else make_labeled_dataset
+        self.labeled_meta_path = Path(make(self.labeled_root, labeled_spec, h=H, w=W))
 
     def _make_checkpoint(self, in_chans=1, qk_norm="rms"):
         encoder, predictor = init_video_model(
@@ -96,8 +106,10 @@ class EvalClassificationCliTest(unittest.TestCase):
         torch.save(checkpoint, self.checkpoint_path)
         return ema_state
 
-    def _make_config(self, series_depth, n_channels=None, qk_norm="rms", eval_series_depth="same"):
-        self.tb_dir = self.root / "tb"
+    def _make_config(
+        self, series_depth, n_channels=None, qk_norm="rms", eval_series_depth="same", dataset_type="internal"
+    ):
+        self.tb_dir = self.root / f"tb_{dataset_type}"
         config = {
             "data": {
                 "dataset_type": "MIDataset",
@@ -122,7 +134,7 @@ class EvalClassificationCliTest(unittest.TestCase):
                 "data": {
                     "data_root": str(self.labeled_root),
                     "label_meta": str(self.labeled_meta_path),
-                    "dataset_type": "internal",
+                    "dataset_type": dataset_type,
                     "series_depth": series_depth if eval_series_depth == "same" else eval_series_depth,
                     "batch_size": 4,
                     "num_workers": 0,
@@ -146,6 +158,19 @@ class EvalClassificationCliTest(unittest.TestCase):
         self._make_datasets(SPEC)
         self._make_config(series_depth=NUM_FRAMES)
         self._run_and_check_tensorboard()
+
+    def test_dataset_type_selects_the_dataset_and_the_adapters_preprocessing(self):
+        # The fixtures' layouts differ (JPEG slices vs NIfTI), so a run only succeeds if the evaluator built the
+        # dataset eval.data.dataset_type names; the adapter must be told the same type.
+        for dataset_type, spec in (("internal", SPEC), ("external", EXTERNAL_SPEC)):
+            with self.subTest(dataset_type=dataset_type):
+                self._make_datasets(spec, dataset_type=dataset_type)
+                self._make_config(series_depth=NUM_FRAMES, dataset_type=dataset_type)
+                with mock.patch(
+                    "app.vjepa_2_1.eval_classification.VJepa21Adapter", wraps=VJepa21Adapter
+                ) as adapter:
+                    self._run_and_check_tensorboard()
+                self.assertEqual(adapter.call_args.kwargs["dataset_type"], dataset_type)
 
     def test_native_depth_is_rejected_up_front(self):
         # V-JEPA 2.1 has no native-depth mode: the encoder is sized for one depth and

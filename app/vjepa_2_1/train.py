@@ -312,10 +312,12 @@ def main(args, resume_preempt=False):
     # -- EVAL (KneeNo classification evaluation, run periodically during pretraining)
     # Absent "eval:" block -> evaluation is skipped entirely.
     cfgs_eval = args.get("eval")
+    dataset_type = None
     if cfgs_eval is not None:
         # VJepa21Adapter keeps the volume depth, so the labeled volumes must be resampled too;
         # checked here rather than failing at the first evaluation batch
         check_series_depth(cfgs_eval.get("data", {}).get("series_depth"), "eval.data.series_depth")
+        dataset_type = cfgs_eval.get("data").get("dataset_type")
     # ----------------------------------------------------------------------- #
 
     np.random.seed(seed)
@@ -658,6 +660,7 @@ def main(args, resume_preempt=False):
     evaluator = None
     if cfgs_eval is not None:
         eval_adapter = VJepa21Adapter(
+            dataset_type=dataset_type,
             embed_dim=embed_dim_encoder,
             crop_size=crop_size,
             normalize=normalize,

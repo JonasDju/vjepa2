@@ -122,6 +122,7 @@ class EvalClassificationCliTest(unittest.TestCase):
                 "data": {
                     "data_root": str(self.labeled_root),
                     "label_meta": str(self.labeled_meta_path),
+                    "dataset_type": "internal",
                     "series_depth": series_depth if eval_series_depth == "same" else eval_series_depth,
                     "batch_size": 4,
                     "num_workers": 0,

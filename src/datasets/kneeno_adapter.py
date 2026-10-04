@@ -52,7 +52,7 @@ class VJepa21Adapter(EncoderAdapter):
     def embed_dim(self):
         return self._embed_dim
 
-    def prepare_input(self, volume):
+    def prepare_input(self, volume, orientation=None):
         """``(1, D, H, W)`` raw volume -> ``(C, D, crop_size, crop_size)`` float32.
 
         Deterministic resize (shorter side -> ``crop_size``) + center crop, then
@@ -65,6 +65,8 @@ class VJepa21Adapter(EncoderAdapter):
         channel axis *before* normalization, i.e. it becomes a gray "RGB video" (R = G = B) that is then
         normalized per channel -- what the official RGB-pretrained checkpoints expect (with
         ``NORMALIZE_RGB``).
+        ``orientation`` is ignored: pretraining feeds the volumes in the orientation they are stored in,
+        so evaluation keeps them in the orientation the labeled dataset returns.
         """
         if not torch.is_tensor(volume):
             volume = torch.as_tensor(volume)

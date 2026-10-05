@@ -164,7 +164,7 @@ def main():
         label_dir_path = Path(label_dir)
         label_dir_path.mkdir(parents=True, exist_ok=True)
 
-        with open(label_dir_path / "params.yaml", "w") as f:
+        with open(label_dir_path.parent / "params.yaml", "w") as f:
             yaml.dump(config, f)
 
     else:

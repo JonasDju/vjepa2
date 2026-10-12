@@ -17,9 +17,13 @@ progress in the log.
 Usage::
 
     .venv/bin/python -m app.vjepa_2_1.eval_classification \\
-        --fname configs/train_2_1/vitb16/pretrain-MI-256px-24f.yaml \\
+        --fname configs/eval_2_1/vitb-384/medical_imaging.yaml \\
         --checkpoint /path/to/latest.pth.tar \\
         --tasks knn linear_pool attentive_pool
+
+Use a standalone eval config like that one, not a pretraining config: those set
+``eval.data.abort_on_io_error: false``, which replaces an exam that fails to load with a random one,
+possibly from another split.
 
 The official (RGB-pretrained) V-JEPA 2.1 checkpoints load the same way, as a baseline: set
 ``model.n_channels: 3`` (the grayscale volumes are repeated to a gray RGB video and normalized with

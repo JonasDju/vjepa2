@@ -252,12 +252,12 @@ class ClassificationEvaluatorAgainstVJepaEncoderTest(unittest.TestCase):
     def _config(self, **overrides):
         config = {
             "seed": 3,
-            "split": {"test_fraction": 0.3},
+            "split": {"train_fraction": 0.5, "val_fraction": 0.2, "test_fraction": 0.3},
             "data": {"series_depth": NUM_FRAMES, "num_workers": 0},
             "logging": {"tensorboard_dir": None},
             "knn": {"k": [3], "batch_size": 4},
-            "linear_pool": {"epochs": 1, "batch_size": 4},
-            "attentive_pool": {"epochs": 1, "batch_size": 4, "num_heads": 4},
+            "linear_pool": {"max_epochs": 1, "batch_size": 4},
+            "attentive_pool": {"max_epochs": 1, "batch_size": 4, "num_heads": 4},
         }
         config.update(overrides)
         return config

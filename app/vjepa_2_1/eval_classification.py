@@ -9,10 +9,10 @@
 
 Loads a frozen encoder from a V-JEPA 2.1 pretraining checkpoint (as written by
 ``app/vjepa_2_1/train.py::save_checkpoint``) and hands it to
-``kneeno.evaluation.ClassificationEvaluator``, logging the *whole* head
-fine-tuning curve to TensorBoard (``log_every_head_epoch=True``) -- unlike the
-in-training hook in ``train.py``, which logs one point per embedding-model
-epoch, here the fine-tuning procedure itself is what we care about.
+``kneeno.evaluation.ClassificationEvaluator``, which trains every head on the train split with
+early stopping on val and logs one point per task: its test metrics (the same protocol as the
+in-training hook in ``train.py``). With ``eval.verbose`` the per-head-epoch val metrics show the
+progress in the log.
 
 Usage::
 
@@ -72,8 +72,8 @@ def parse_args():
         nargs="+",
         default=None,
         choices=["knn", "linear_pool", "attentive_pool"],
-        help="subset of tasks to run; defaults to all four (note: 'linear' unavailable, use "
-        "linear_pool instead)",
+        help="subset of tasks to run; defaults to every task V-JEPA 2.1 supports (knn, linear_pool, "
+        "attentive_pool; 'linear' needs a cls token, use linear_pool instead)",
     )
     parser.add_argument("--device", type=str, default="cpu", help="e.g. 'cpu' or 'cuda:0'")
     return parser.parse_args()
@@ -200,7 +200,7 @@ def main():
 
     evaluator = ClassificationEvaluator(config=cfgs_eval, adapter=adapter, device=device)
     try:
-        metrics = evaluator.evaluate(encoder, tasks=args.tasks, epoch=0, log_every_head_epoch=True)
+        metrics = evaluator.evaluate(encoder, tasks=args.tasks, epoch=0)
     finally:
         # Flush+close the TensorBoard writer so buffered scalars are not lost
         # if the process exits right after

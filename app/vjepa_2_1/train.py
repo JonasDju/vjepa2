@@ -1081,8 +1081,8 @@ def main(args, resume_preempt=False):
                 save_every_path = os.path.join(folder, save_every_file)
                 save_checkpoint(epoch + 1, save_every_path)
 
-        # KneeNo classification evaluation (frozen encoder). One TensorBoard
-        # point per embedding-model epoch (log_every_head_epoch=False) so e.g.
+        # KneeNo classification evaluation (frozen encoder). Each task logs one
+        # TensorBoard point per embedding-model epoch, its test metrics, so e.g.
         # the knn and linear_pool curves stay aligned even though knn has no
         # head-training epochs and linear_pool has several. Called on every
         # rank, but ClassificationEvaluator itself only does work on rank 0 and
@@ -1091,9 +1091,7 @@ def main(args, resume_preempt=False):
             due_tasks = tasks_due(epoch, evaluator.config["freq"])
             if due_tasks:
                 eval_encoder = target_encoder if evaluator.config.get("encoder", "target") == "target" else encoder
-                eval_metrics = evaluator.evaluate(
-                    eval_encoder, tasks=due_tasks, epoch=epoch, log_every_head_epoch=False
-                )
+                eval_metrics = evaluator.evaluate(eval_encoder, tasks=due_tasks, epoch=epoch)
                 logger.info(f"[epoch {epoch + 1}] eval ({due_tasks}): {eval_metrics}")
 
     if evaluator is not None:

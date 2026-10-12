@@ -7,8 +7,7 @@
 (``app/vjepa_2_1/eval_classification.py``): builds a tiny checkpoint the way
 ``train.py::save_checkpoint`` would, then drives the script's own ``main()``
 through ``sys.argv`` -- exercising config parsing, encoder reconstruction,
-checkpoint loading, and the standalone (``log_every_head_epoch=True``) call
-into ``ClassificationEvaluator`` in one pass.
+checkpoint loading, and the standalone call into ``ClassificationEvaluator`` in one pass.
 """
 
 import sys
@@ -130,7 +129,7 @@ class EvalClassificationCliTest(unittest.TestCase):
             },
             "eval": {
                 "seed": 1,
-                "split": {"test_fraction": 0.3},
+                "split": {"train_fraction": 0.5, "val_fraction": 0.2, "test_fraction": 0.3},
                 "data": {
                     "data_root": str(self.labeled_root),
                     "label_meta": str(self.labeled_meta_path),
@@ -141,8 +140,8 @@ class EvalClassificationCliTest(unittest.TestCase):
                 },
                 "logging": {"tensorboard_dir": str(self.tb_dir)},
                 "knn": {"k": [3]},
-                "linear_pool": {"epochs": 2, "batch_size": 4},
-                "attentive_pool": {"epochs": 2, "batch_size": 4, "num_heads": 4},
+                "linear_pool": {"max_epochs": 2, "batch_size": 4},
+                "attentive_pool": {"max_epochs": 2, "batch_size": 4, "num_heads": 4},
             },
         }
         if n_channels is not None:
@@ -154,7 +153,7 @@ class EvalClassificationCliTest(unittest.TestCase):
         self.config_path = self.root / "config.yaml"
         self.config_path.write_text(yaml.dump(config))
 
-    def test_cli_runs_and_logs_one_point_per_head_epoch(self):
+    def test_cli_runs_and_logs_one_test_point_per_task(self):
         self._make_datasets(SPEC)
         self._make_config(series_depth=NUM_FRAMES)
         self._run_and_check_tensorboard()
@@ -270,9 +269,8 @@ class EvalClassificationCliTest(unittest.TestCase):
         self.assertTrue(any(t.startswith("eval/linear_pool") for t in tags))
         self.assertTrue(any(t.startswith("eval/attentive_pool") for t in tags))
         for tag in tags:
-            events = ea.Scalars(tag)
-            expected = 1 if tag.startswith("eval/knn") else 2  # linear_pool/attentive_pool ran 2 head epochs
-            self.assertEqual(len(events), expected, f"{tag}: expected {expected} points, got {len(events)}")
+            # Only the test metrics are logged, once per task, however many head epochs ran.
+            self.assertEqual([e.step for e in ea.Scalars(tag)], [0], tag)
 
 
 if __name__ == "__main__":

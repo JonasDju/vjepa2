@@ -142,8 +142,14 @@ eval:
   amp_dtype: bfloat16  # frozen-encoder forward under autocast (CUDA only); null -> float32. Heads still train in float32.
   cache_features: true  # linear / linear_pool train on embeddings extracted once per evaluation instead of
                         # re-encoding every head epoch; k-NN always uses the shared pass. attentive_pool never caches.
-  split:
-    test_fraction: 0.2
+  split:  # fractions of the labeled exams, each > 0, summing to 1
+    train_fraction: 0.7
+    val_fraction: 0.1  # heads are scored on val every head epoch (early stopping)
+    test_fraction: 0.2  # scored once with each head's best val epoch; the reported numbers
+  training:
+    early_stop_on: auroc  # val metric that picks each head's best epoch
+    early_stop_patience: 5  # head epochs without a val improvement before stopping; 0 = never stop early
+  verbose: true  # log each task's start and every head epoch's val metrics
   data:
     data_root: /dev/shm/kneeno_data/internal
     label_meta: /hpcwork/p0021834/workspace_roman/jonas/BigKneeTar/metadata_labeled.json
@@ -174,6 +180,6 @@ eval:
   linear_pool:
     pooling: avg
     batchnorm: true  # non-affine BatchNorm1d (z-score) in front of the linear layer
-    epochs: 20
+    max_epochs: 20
     batch_size: 32  # exams
     lr: 0.001

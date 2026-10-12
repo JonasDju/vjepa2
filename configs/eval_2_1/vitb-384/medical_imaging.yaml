@@ -75,7 +75,7 @@ eval:
   data:
     data_root: $TMP/kneeno_data/internal
     label_meta: /hpcwork/p0021834/workspace_roman/jonas/BigKneeTar/metadata_labeled.json
-    dataset_type: internal
+    dataset_type: internal  # internal | external | mixed (mixed: data_root and label_meta as {internal: ..., external: ...})
     series_depth: 24  # match the series_depth above -- no resampling distribution shift
     resample_mode: nearest
     num_workers: 16

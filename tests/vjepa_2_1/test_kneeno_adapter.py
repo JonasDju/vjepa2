@@ -56,7 +56,7 @@ def make_tiny_encoder():
 class VJepa21AdapterTest(unittest.TestCase):
     def setUp(self):
         self.adapter = VJepa21Adapter(
-            dataset_type="internal", embed_dim=EMBED_DIM, crop_size=CROP_SIZE, normalize=((0.5,), (0.5,))
+            embed_dim=EMBED_DIM, crop_size=CROP_SIZE, normalize=((0.5,), (0.5,))
         )
         rng = np.random.default_rng(0)
         self.volume = torch.from_numpy(
@@ -64,18 +64,18 @@ class VJepa21AdapterTest(unittest.TestCase):
         )
 
     def test_prepare_input_shape_and_dtype(self):
-        prepped = self.adapter.prepare_input(self.volume)
+        prepped = self.adapter.prepare_input(self.volume, source="internal")
         self.assertEqual(tuple(prepped.shape), (1, NUM_FRAMES, CROP_SIZE, CROP_SIZE))
         self.assertEqual(prepped.dtype, torch.float32)
 
     def test_collate_stacks_batch_axis(self):
-        prepped = [self.adapter.prepare_input(self.volume) for _ in range(3)]
+        prepped = [self.adapter.prepare_input(self.volume, source="internal") for _ in range(3)]
         batch = self.adapter.collate(prepped)
         self.assertEqual(tuple(batch.shape), (3, 1, NUM_FRAMES, CROP_SIZE, CROP_SIZE))
 
     def test_forward_features_against_real_encoder(self):
         model = make_tiny_encoder()
-        batch = self.adapter.collate([self.adapter.prepare_input(self.volume) for _ in range(2)])
+        batch = self.adapter.collate([self.adapter.prepare_input(self.volume, source="internal") for _ in range(2)])
         with torch.no_grad():
             out = self.adapter.forward_features(model, batch)
 
@@ -100,23 +100,23 @@ class RepeatedChannelsTest(unittest.TestCase):
         # each channel must be the gray volume normalized with *that* channel's mean/std -- identical to
         # the 1-channel path run with the channel's (mean, std) alone
         rgb = VJepa21Adapter(
-            dataset_type="internal", embed_dim=EMBED_DIM, n_channels=3, crop_size=CROP_SIZE, normalize=NORMALIZE_RGB
+            embed_dim=EMBED_DIM, n_channels=3, crop_size=CROP_SIZE, normalize=NORMALIZE_RGB
         )
-        prepped = rgb.prepare_input(self.volume)
+        prepped = rgb.prepare_input(self.volume, source="internal")
         self.assertEqual(tuple(prepped.shape), (3, NUM_FRAMES, CROP_SIZE, CROP_SIZE))
         self.assertTrue(prepped.is_contiguous())
         for c, (mean, std) in enumerate(zip(*NORMALIZE_RGB)):
             gray = VJepa21Adapter(
-                dataset_type="internal", embed_dim=EMBED_DIM, crop_size=CROP_SIZE, normalize=((mean,), (std,))
+                embed_dim=EMBED_DIM, crop_size=CROP_SIZE, normalize=((mean,), (std,))
             )
-            torch.testing.assert_close(prepped[c], gray.prepare_input(self.volume)[0])
+            torch.testing.assert_close(prepped[c], gray.prepare_input(self.volume, source="internal")[0])
         self.assertFalse(torch.equal(prepped[0], prepped[1]))
 
     def test_single_normalization_shared_by_all_channels(self):
         adapter = VJepa21Adapter(
-            dataset_type="internal", embed_dim=EMBED_DIM, n_channels=3, crop_size=CROP_SIZE, normalize=NORMALIZE_MI
+            embed_dim=EMBED_DIM, n_channels=3, crop_size=CROP_SIZE, normalize=NORMALIZE_MI
         )
-        prepped = adapter.prepare_input(self.volume)
+        prepped = adapter.prepare_input(self.volume, source="internal")
         self.assertEqual(prepped.shape[0], 3)
         self.assertTrue(torch.equal(prepped[0], prepped[1]) and torch.equal(prepped[1], prepped[2]))
 
@@ -124,7 +124,6 @@ class RepeatedChannelsTest(unittest.TestCase):
         # 1-channel adapter + RGB normalize used to broadcast the volume to 3 channels silently
         with self.assertRaises(ValueError):
             VJepa21Adapter(
-                dataset_type="internal",
                 embed_dim=EMBED_DIM,
                 n_channels=1,
                 crop_size=CROP_SIZE,
@@ -132,7 +131,6 @@ class RepeatedChannelsTest(unittest.TestCase):
             )
         with self.assertRaises(ValueError):
             VJepa21Adapter(
-                dataset_type="internal",
                 embed_dim=EMBED_DIM,
                 n_channels=2,
                 crop_size=CROP_SIZE,
@@ -141,10 +139,10 @@ class RepeatedChannelsTest(unittest.TestCase):
 
     def test_rejects_multichannel_input(self):
         adapter = VJepa21Adapter(
-            dataset_type="internal", embed_dim=EMBED_DIM, n_channels=3, crop_size=CROP_SIZE, normalize=NORMALIZE_RGB
+            embed_dim=EMBED_DIM, n_channels=3, crop_size=CROP_SIZE, normalize=NORMALIZE_RGB
         )
         with self.assertRaises(ValueError):
-            adapter.prepare_input(self.volume.repeat(3, 1, 1, 1))
+            adapter.prepare_input(self.volume.repeat(3, 1, 1, 1), source="internal")
 
     def test_forward_through_rgb_encoder(self):
         encoder, _ = init_video_model(
@@ -162,13 +160,12 @@ class RepeatedChannelsTest(unittest.TestCase):
         )
         encoder.eval()
         adapter = VJepa21Adapter(
-            dataset_type="internal",
             embed_dim=encoder.embed_dim,
             n_channels=3,
             crop_size=CROP_SIZE,
             normalize=NORMALIZE_RGB,
         )
-        batch = adapter.collate([adapter.prepare_input(self.volume) for _ in range(2)])
+        batch = adapter.collate([adapter.prepare_input(self.volume, source="internal") for _ in range(2)])
         self.assertEqual(tuple(batch.shape), (2, 3, NUM_FRAMES, CROP_SIZE, CROP_SIZE))
         with torch.no_grad():
             out = adapter.forward_features(encoder, batch)
@@ -177,7 +174,7 @@ class RepeatedChannelsTest(unittest.TestCase):
 
 
 class ExternalPreprocessingTest(unittest.TestCase):
-    """``dataset_type="external"``: the raw NIfTI volume is first quantized the way the internal JPEGs were
+    """``source="external"``: the raw NIfTI volume is first quantized the way the internal JPEGs were
     (``LabeledExternalKneeMRIDataset.to_uint8``); everything after that is the internal path."""
 
     def test_external_volume_is_prepared_like_its_uint8_version(self):
@@ -187,16 +184,19 @@ class ExternalPreprocessingTest(unittest.TestCase):
                 raw = torch.from_numpy((rng.random((1, NUM_FRAMES, H, W)) * 1000).astype(dtype))
                 kwargs = dict(embed_dim=EMBED_DIM, crop_size=CROP_SIZE, normalize=((0.5,), (0.5,)))
                 quantized = torch.from_numpy(LabeledExternalKneeMRIDataset.to_uint8(raw.numpy()))
-                expected = VJepa21Adapter(dataset_type="internal", **kwargs).prepare_input(quantized)
-                out = VJepa21Adapter(dataset_type="external", **kwargs).prepare_input(raw)
+                adapter = VJepa21Adapter(**kwargs)
+                expected = adapter.prepare_input(quantized, source="internal")
+                out = adapter.prepare_input(raw, source="external")
                 torch.testing.assert_close(out, expected)
 
 
-    def test_unknown_dataset_type_raises(self):
+    def test_unknown_source_raises(self):
         # Anything but "external" would otherwise silently take the internal path.
-        for dataset_type in (None, "External", "nifti"):
-            with self.subTest(dataset_type=dataset_type), self.assertRaisesRegex(ValueError, "dataset_type"):
-                VJepa21Adapter(dataset_type=dataset_type, embed_dim=EMBED_DIM, crop_size=CROP_SIZE)
+        adapter = VJepa21Adapter(embed_dim=EMBED_DIM, crop_size=CROP_SIZE)
+        volume = torch.zeros(1, NUM_FRAMES, H, W, dtype=torch.uint8)
+        for source in (None, "External", "nifti", "mixed"):
+            with self.subTest(source=source), self.assertRaisesRegex(ValueError, "source"):
+                adapter.prepare_input(volume, source=source)
 
 
 class InitVideoModelCompatibilityTest(unittest.TestCase):
@@ -219,12 +219,12 @@ class InitVideoModelCompatibilityTest(unittest.TestCase):
         )
         encoder.eval()
         adapter = VJepa21Adapter(
-            dataset_type="internal", embed_dim=encoder.embed_dim, crop_size=CROP_SIZE, normalize=((0.5,), (0.5,))
+            embed_dim=encoder.embed_dim, crop_size=CROP_SIZE, normalize=((0.5,), (0.5,))
         )
 
         rng = np.random.default_rng(0)
         volume = torch.from_numpy(rng.integers(0, 256, size=(1, NUM_FRAMES, H, W), dtype=np.uint8))
-        batch = adapter.collate([adapter.prepare_input(volume) for _ in range(2)])
+        batch = adapter.collate([adapter.prepare_input(volume, source="internal") for _ in range(2)])
 
         with torch.no_grad():
             out = adapter.forward_features(encoder, batch)
@@ -246,7 +246,7 @@ class ClassificationEvaluatorAgainstVJepaEncoderTest(unittest.TestCase):
         )
         self.model = make_tiny_encoder()
         self.adapter = VJepa21Adapter(
-            dataset_type="external", embed_dim=EMBED_DIM, crop_size=CROP_SIZE, normalize=((0.5,), (0.5,))
+            embed_dim=EMBED_DIM, crop_size=CROP_SIZE, normalize=((0.5,), (0.5,))
         )
 
     def _config(self, **overrides):

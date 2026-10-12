@@ -19,8 +19,9 @@ from unittest import mock
 import torch
 import yaml
 
+from kneeno import LabeledExternalKneeMRIDataset
+
 from app.vjepa_2_1.utils import init_video_model
-from src.datasets.kneeno_adapter import VJepa21Adapter
 from tests.vjepa_2_1.labeled_fixture import (
     EXTERNAL_SEQUENCES,
     INTERNAL_SEQUENCES,
@@ -160,16 +161,17 @@ class EvalClassificationCliTest(unittest.TestCase):
 
     def test_dataset_type_selects_the_dataset_and_the_adapters_preprocessing(self):
         # The fixtures' layouts differ (JPEG slices vs NIfTI), so a run only succeeds if the evaluator built the
-        # dataset eval.data.dataset_type names; the adapter must be told the same type.
+        # dataset eval.data.dataset_type names. The adapter learns each volume's source from the dataset's items:
+        # only external volumes are quantized (num_workers is 0, so the spy sees every call).
         for dataset_type, spec in (("internal", SPEC), ("external", EXTERNAL_SPEC)):
             with self.subTest(dataset_type=dataset_type):
                 self._make_datasets(spec, dataset_type=dataset_type)
                 self._make_config(series_depth=NUM_FRAMES, dataset_type=dataset_type)
-                with mock.patch(
-                    "app.vjepa_2_1.eval_classification.VJepa21Adapter", wraps=VJepa21Adapter
-                ) as adapter:
+                with mock.patch.object(
+                    LabeledExternalKneeMRIDataset, "to_uint8", wraps=LabeledExternalKneeMRIDataset.to_uint8
+                ) as to_uint8:
                     self._run_and_check_tensorboard()
-                self.assertEqual(adapter.call_args.kwargs["dataset_type"], dataset_type)
+                self.assertEqual(to_uint8.called, dataset_type == "external")
 
     def test_native_depth_is_rejected_up_front(self):
         # V-JEPA 2.1 has no native-depth mode: the encoder is sized for one depth and

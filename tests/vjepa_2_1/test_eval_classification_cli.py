@@ -106,16 +106,11 @@ class EvalClassificationCliTest(unittest.TestCase):
         torch.save(checkpoint, self.checkpoint_path)
         return ema_state
 
-    def _make_config(
-        self, series_depth, n_channels=None, qk_norm="rms", eval_series_depth="same", dataset_type="internal"
-    ):
+    def _make_config(self, series_depth, n_channels=None, qk_norm="rms", dataset_type="internal"):
+        # data: only holds the encoder's architecture; its depth is eval.data.series_depth
         self.tb_dir = self.root / f"tb_{dataset_type}"
         config = {
             "data": {
-                "dataset_type": "MIDataset",
-                "data_root": str(self.root / "unlabeled"),
-                "series_depth": series_depth,
-                "resample_mode": "nearest",
                 "patch_size": PATCH_SIZE,
                 "tubelet_size": TUBELET_SIZE,
                 "crop_size": CROP_SIZE,
@@ -135,7 +130,7 @@ class EvalClassificationCliTest(unittest.TestCase):
                     "data_root": str(self.labeled_root),
                     "label_meta": str(self.labeled_meta_path),
                     "dataset_type": dataset_type,
-                    "series_depth": series_depth if eval_series_depth == "same" else eval_series_depth,
+                    "series_depth": series_depth,
                     "batch_size": 4,
                     "num_workers": 0,
                 },
@@ -174,12 +169,12 @@ class EvalClassificationCliTest(unittest.TestCase):
                 self.assertEqual(to_uint8.called, dataset_type == "external")
 
     def test_native_depth_is_rejected_up_front(self):
-        # V-JEPA 2.1 has no native-depth mode: the encoder is sized for one depth and
-        # VJepa21Adapter keeps whatever depth it gets, so both blocks need series_depth > 0.
+        # V-JEPA 2.1 has no native-depth mode: the encoder is sized for eval.data.series_depth and
+        # VJepa21Adapter keeps whatever depth it gets, so it must be > 0.
         self._make_datasets(SPEC)
-        for pretrain, evaluation in ((0, NUM_FRAMES), (-1, NUM_FRAMES), (NUM_FRAMES, 0), (NUM_FRAMES, None)):
-            with self.subTest(pretrain=pretrain, evaluation=evaluation):
-                self._make_config(series_depth=pretrain, eval_series_depth=evaluation)
+        for series_depth in (0, -1, None):
+            with self.subTest(series_depth=series_depth):
+                self._make_config(series_depth=series_depth)
                 with self.assertRaisesRegex(ValueError, "series_depth must be a positive number"):
                     self._run_main()
 

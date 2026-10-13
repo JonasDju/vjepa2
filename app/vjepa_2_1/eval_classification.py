@@ -176,14 +176,12 @@ def main():
 
     cfgs_model = config["model"]
     cfgs_data = config["data"]
-    is_mi_dataset = cfgs_data.get("dataset_type", "videodataset").lower() == "midataset"
-    in_chans = cfgs_model.get("n_channels", 1 if is_mi_dataset else 3)
+    in_chans = cfgs_model.get("n_channels", 1)
 
     # the encoder is sized for the pretraining depth; the labeled volumes are resampled as well,
     # since VJepa21Adapter keeps whatever depth it is given
-    max_num_frames = cfgs_data.get("series_depth")
-    check_series_depth(max_num_frames)
-    check_series_depth(cfgs_eval.get("data", {}).get("series_depth"), "eval.data.series_depth")
+    max_num_frames = cfgs_eval.get("data", {}).get("series_depth")
+    check_series_depth(max_num_frames, "eval.data.series_depth")
 
     device = torch.device(args.device)
 

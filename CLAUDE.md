@@ -176,8 +176,10 @@ bridge and the wiring.
   `src/utils/distributed.py` creates the process group with a 180-min timeout
   (`PROCESS_GROUP_TIMEOUT`; NCCL's default of 10 min would abort multi-GPU runs).
 - `app/vjepa_2_1/eval_classification.py` — standalone post-training script. Rebuilds an
-  encoder via `init_video_model` (must mirror the pretraining `model:`/`data:` config
-  exactly, or the checkpoint's `state_dict` keys/shapes won't match), loads the requested
+  encoder via `init_video_model` (must mirror the pretraining architecture exactly, or the
+  checkpoint's `state_dict` keys/shapes won't match: `model:`, plus `data:`'s `patch_size` /
+  `tubelet_size` / `crop_size`, the only keys it reads from `data:`; the encoder's depth is
+  `eval.data.series_depth`, so `n_channels` defaults to 1), loads the requested
   encoder's weights from a `save_checkpoint`-produced `.pth.tar` (stripping the DDP `module.`
   prefix, `strict=True`), freezes it, and calls `evaluate(..., epoch=0)` once. Like the
   in-training hook it logs one point per task, the test metrics of each head's best val epoch;
@@ -227,8 +229,9 @@ too. Until 2026-10-12 `train.py` read the eval `dataset_type` into the same vari
 `data.dataset_type`, so `init_data` got `"internal"` and failed (since 7cc546e, 2026-10-05). Evaluation is
 exam-level: one sample = the four sequence volumes of one exam (see `MA/CLAUDE.md`), and every
 `eval.*.batch_size` / `eval.data.subset` counts exams, so the encoder sees 4x `batch_size` volumes. `series_depth` under `eval.data` should match
-`data.series_depth` (both must be `> 0`; checked at startup by `train.py` and the standalone
-script). `SimpleITK` must be
+`data.series_depth` (both must be `> 0`; checked at startup by `train.py`). The standalone
+script has no pretraining `data.series_depth`: it builds the encoder with `eval.data.series_depth`
+and checks only that one. Set it to the pretraining depth. `SimpleITK` must be
 installed in this venv (`uv lock`/`uv sync` after the KneeNo change; locally `uv pip install simpleitk`).
 
 ## Env vars in configs
@@ -256,8 +259,8 @@ evaluation bridge: `VJepa21Adapter` against both a hand-built `VisionTransformer
 real `init_video_model` factory (`test_kneeno_adapter.py`), and a full
 `app/vjepa_2_1/eval_classification.py` CLI run against a synthetic checkpoint + labeled
 dataset, asserting every task logs exactly one TensorBoard point (its test metrics)
-(`test_eval_classification_cli.py`, which also checks that a non-positive `series_depth` in
-either block is rejected up front). The
+(`test_eval_classification_cli.py`, which also checks that a non-positive or missing
+`eval.data.series_depth` is rejected up front). The
 labeled fixture is `tests/vjepa_2_1/labeled_fixture.py`: `make_labeled_dataset` (tiny NIfTIs named
 `sag`/`sagt1`/`cor`/`ax` + `{"label_names", "cases"}` JSON, for `LabeledExternalKneeMRIDataset`; needs
 SimpleITK) and

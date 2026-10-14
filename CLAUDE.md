@@ -104,8 +104,11 @@ native-depth mode.
 **Data layout**
 ```
 data_root/<case_id>/<series_name>/<NNN>.jpeg      # NNN = 000 .. n_images-1
-data_meta  -> metadata.json: { case_id: { series_name: {"dimensions": [H, W, n_images], ...} } }
+data_meta  -> metadata.json: { split: { case_id: { series_name: {"dimensions": [H, W, n_images], ...} } } }
 ```
+`split` is a global split (KneeNo `data/internal/extract_unlabeled_meta.py`); pretraining reads only `train` and
+`unlabeled` (`kneeno.dataset.PRETRAINING_SPLITS`), never `val`, the evaluation's `internal` test set. A metadata
+file without the split level raises.
 `series_name` ∈ {`cor`, `sag`, `st1`, `tra`} but not every case has all four — iterate
 whatever keys exist. `metadata.json` at the repo root is a ~19 MB reference sample
 (untracked, keep it that way): **only ever read a few lines of it**.
@@ -165,10 +168,11 @@ bridge and the wiring.
   with whatever tasks `kneeno.evaluation.tasks_due(epoch, evaluator.config["freq"])` returns
   due — so e.g. `knn` (freq 1) and `linear_pool` (freq 5) each log exactly one TensorBoard
   point (their test metrics) per *embedding-model* epoch, keeping their curves aligned despite
-  `linear_pool` running several internal head-training epochs (early-stopped on val). Each trained head
-  also logs its best epoch's `<task>/val_auroc`: compare epochs by that, not by the test curves. The
-  pretraining configs set `eval.data.abort_on_io_error: false` (an exam that fails to load is replaced by a
-  random one rather than killing the run).
+  `linear_pool` running several internal head-training epochs (early-stopped on val). The pretraining
+  configs test on `internal` only (`eval.data.test_sets: [internal]`, exams never pretrained on): compare
+  epochs by the `internal/*` curves. Each trained head also logs `evaluation_val/<task>/val_auroc` (val exams
+  were pretrained on). The pretraining configs set `eval.data.abort_on_io_error: false` (an exam that fails to
+  load is replaced by a random one rather than killing the run).
   Called on every rank; `ClassificationEvaluator` only does work on rank 0 internally
   (barrier + broadcast), so this is safe under DDP without any rank-guarding here.
   `eval.encoder` selects `target_encoder` (EMA, default) or `encoder` (online).
@@ -182,17 +186,20 @@ bridge and the wiring.
   `eval.data.series_depth`, so `n_channels` defaults to 1), loads the requested
   encoder's weights from a `save_checkpoint`-produced `.pth.tar` (stripping the DDP `module.`
   prefix, `strict=True`), freezes it, and calls `evaluate(..., epoch=0)` once. Like the
-  in-training hook it logs one point per task, the test metrics of each head's best val epoch;
+  in-training hook it logs one point per task and test set, the test metrics of each head's best val epoch;
   `eval.verbose` puts the per-head-epoch val metrics in the log. Its config
-  (`configs/eval_2_1/vitb-384/medical_imaging.yaml`) sets `eval.data.abort_on_io_error: true`: an exam
-  that fails to load raises instead of being replaced by one of another split. Run as:
+  (`configs/eval_2_1/vitb-384/medical_imaging.yaml`) tests on `[internal, external]` (heads trained once,
+  scored on both) and sets `eval.data.abort_on_io_error: true`: an exam that fails to load raises instead of
+  being replaced by another one. Its `label_meta.external` is `/hpcwork/p0021834/workspace_roman/jonas/metadata/external_labeled.json`, and
+  `$TMP/kneeno_data/external` must be extracted first (KneeNo `prepare_data.py --external-tar
+  /hpcwork/p0021834/workspace_roman/jonas/uka_gold_nifti.tar`; this repo has no submit script that does it). Run as:
   ```bash
   .venv/bin/python -m app.vjepa_2_1.eval_classification \
     --fname configs/eval_2_1/vitb-384/medical_imaging.yaml \
     --checkpoint /path/to/latest.pth.tar --tasks knn linear_pool attentive_pool
   ```
-  Don't pass a pretraining config: its `abort_on_io_error: false` lets a broken exam be replaced by one of
-  another split.
+  Don't pass a pretraining config: its `abort_on_io_error: false` lets a broken exam be replaced by another
+  one, and it tests on `internal` only.
   **Before the strict-loading fix this script evaluated a randomly initialised encoder** on
   every real checkpoint: it neither stripped `module.` nor forwarded `model.qk_norm`, and
   `load_state_dict(strict=False)` skipped all 182 unmatched keys silently. Any standalone
@@ -200,10 +207,12 @@ bridge and the wiring.
   `eval.logging` dirs — point those somewhere else than the training run's own dirs.
 
 **Config**: an `eval:` block at the YAML top level (sibling of `data:`/`model:`/etc.),
-consumed by both the in-training hook and the standalone script. Since 2026-10-12 it uses
-KneeNo's train/val/test protocol: `split.{train,val,test}_fraction`, `training.early_stop_on` /
-`early_stop_patience`, `verbose`, and `max_epochs` (not `epochs`) per head task; an old-style
-`epochs` or test-only `split` is rejected at load. See
+consumed by both the in-training hook and the standalone script. Since 2026-10-14 it uses
+KneeNo's global splits: `split.val_fraction` cuts the internal `train` split into the heads' train and val,
+`eval.data.test_sets` names the test sets (`internal` = internal `val`, `external` = the external dataset),
+`data_root` / `label_meta` are `{internal: ..., external: ...}` mappings; plus `training.early_stop_on` /
+`early_stop_patience`, `verbose`, and `max_epochs` (not `epochs`) per head task. Old keys
+(`epochs`, `split.train_fraction` / `test_fraction`, `data.dataset_type`) are rejected at load. See
 `configs/train_2_1/vitb16/pretrain-MI-256px-24f.yaml` for a real example, and
 `KneeNo/kneeno/evaluation/config.py::DEFAULT_EVAL_CONFIG` for every key/default. **Trap
 to watch for:** config merging is a deep-merge over the defaults, so disabling a task
@@ -212,21 +221,20 @@ that has a nonzero *default* frequency (`linear` defaults to 5) requires an *exp
 enabled. This matters here specifically because `linear` is unavailable for this model
 and selecting it raises.
 
-**Status:** `eval.data.dataset_type` picks the labeled dataset the evaluator builds
-(`KneeNo/kneeno/evaluation/dataset.py`; layouts/schemas in `KneeNo/README.md`). It has no default (unset raises).
-`internal` (what every shipped config sets) is `LabeledInternalKneeMRIDataset`: the JPEG slices
-pretraining reads (`eval.data.data_root` = `.../kneeno_data/internal`, `eval.data.label_meta` =
-`BigKneeTar/metadata_labeled.json`). `external` is `LabeledExternalKneeMRIDataset`: one reoriented
-`.nii.gz` per series under `.../kneeno_data/external` (`prepare_data.py --external-tar`), metadata
-from `data/external/extract_unlabeled_meta.py` + `data/merge_labels_into_unlabeled_meta.py`. Its volumes
+**Status:** the evaluator builds a `KneeNoEvalDataset` from `eval.data` (`KneeNo/kneeno/evaluation/dataset.py`;
+layouts/schemas in `KneeNo/README.md`): the train part is `LabeledInternalKneeMRIDataset(split="train")`, the JPEG
+slices pretraining reads (`data_root.internal` = `.../kneeno_data/internal`, `label_meta.internal` =
+`BigKneeTar/metadata_labeled.json`); test set `internal` is its global `val` split; test set `external` is
+`LabeledExternalKneeMRIDataset(split="test")`: one reoriented `.nii.gz` per series under
+`.../kneeno_data/external` (`prepare_data.py --external-tar`), metadata from `data/external/extract_unlabeled_meta.py`
++ `data/merge_labels_into_unlabeled_meta.py`. `test_sets` has no default (unset raises). External volumes
 come back **unscaled, in the file's own dtype** (e.g. int16 in the thousands);
-`VJepa21Adapter.prepare_input` rescales them with `LabeledExternalKneeMRIDataset.to_uint8` first, so
-`external` works like `internal`. It decides per volume from `source` (`"internal"` / `"external"`, from the
-dataset's `(volumes, labels, source)` items, passed by KneeNo), not from the config: the adapter has no
-`dataset_type` argument any more, and an unknown `source` raises. `mixed` (train/val on internal, test on every
-external exam; `eval.data.data_root` / `label_meta` as `{internal: ..., external: ...}` mappings) therefore works
-too. Until 2026-10-12 `train.py` read the eval `dataset_type` into the same variable as the pretraining
-`data.dataset_type`, so `init_data` got `"internal"` and failed (since 7cc546e, 2026-10-05). Evaluation is
+`VJepa21Adapter.prepare_input` rescales them with `LabeledExternalKneeMRIDataset.to_uint8` first. It decides per
+volume from `source` (`"internal"` / `"external"`, from the dataset's `(volumes, labels, source)` items, passed by
+KneeNo), not from the config, and an unknown `source` raises; so one evaluation can mix both. Until 2026-10-12
+`train.py` read the eval `dataset_type` into the same variable as the pretraining `data.dataset_type`, so
+`init_data` got `"internal"` and failed (since 7cc546e, 2026-10-05). Checkpoints pretrained before the global
+splits saw the internal `val` exams: only their `external` numbers are clean. Evaluation is
 exam-level: one sample = the four sequence volumes of one exam (see `MA/CLAUDE.md`), and every
 `eval.*.batch_size` / `eval.data.subset` counts exams, so the encoder sees 4x `batch_size` volumes. `series_depth` under `eval.data` should match
 `data.series_depth` (both must be `> 0`; checked at startup by `train.py`). The standalone
@@ -262,11 +270,12 @@ dataset, asserting every task logs exactly one TensorBoard point (its test metri
 (`test_eval_classification_cli.py`, which also checks that a non-positive or missing
 `eval.data.series_depth` is rejected up front). The
 labeled fixture is `tests/vjepa_2_1/labeled_fixture.py`: `make_labeled_dataset` (tiny NIfTIs named
-`sag`/`sagt1`/`cor`/`ax` + `{"label_names", "cases"}` JSON, for `LabeledExternalKneeMRIDataset`; needs
-SimpleITK) and
-`make_internal_labeled_dataset` (JPEG slices + `{"label_names", "cases"}` JSON, for
-`LabeledInternalKneeMRIDataset` — the dataset `ClassificationEvaluator` builds itself from
-`eval.data`, so the CLI test must use this one). The model-agnostic core is tested in
+`sag`/`sagt1`/`cor`/`ax` + `{"label_names", "splits"}` JSON, every exam in `test` by default, for
+`LabeledExternalKneeMRIDataset`; needs SimpleITK), `make_internal_labeled_dataset` (JPEG slices +
+`{"label_names", "splits"}` JSON, `train` by default, `case_splits` moves exams to `val`, for
+`LabeledInternalKneeMRIDataset` — the train part `ClassificationEvaluator` builds itself from
+`eval.data`, so the CLI test must use this one) and `make_eval_dataset` (a `KneeNoEvalDataset` over the NIfTI
+fixture with test set `external`, to inject into the evaluator). The model-agnostic core is tested in
 `KneeNo/tests/test_dataset.py`, `test_labeled_dataset.py` and `test_evaluation.py`
 (`python -m unittest discover -s tests` from `KneeNo/`): both
 resample modes, shape/dtype, and all four classification tasks end to end against a

@@ -23,7 +23,7 @@ from app.vjepa_2_1.utils import init_video_model
 from app.vjepa_2_1.wrappers import MultiSeqWrapper
 from kneeno import ClassificationEvaluator, LabeledExternalKneeMRIDataset
 from src.datasets.kneeno_adapter import VJepa21Adapter
-from tests.vjepa_2_1.labeled_fixture import EXTERNAL_SEQUENCES, full_exam_spec, make_labeled_dataset
+from tests.vjepa_2_1.labeled_fixture import EXTERNAL_SEQUENCES, full_exam_spec, make_eval_dataset
 
 H, W = 20, 24
 SPEC = full_exam_spec(10, EXTERNAL_SEQUENCES)  # 10 complete exams
@@ -240,9 +240,9 @@ class ClassificationEvaluatorAgainstVJepaEncoderTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.meta = make_labeled_dataset(self._tmp.name, SPEC, h=H, w=W)
-        self.dataset = LabeledExternalKneeMRIDataset(
-            self._tmp.name, self.meta, series_depth=NUM_FRAMES, resample_mode="nearest"
+        # 7 train-part exams (5 train / 2 val with the split below) and the 3-exam test set "external"
+        self.dataset = make_eval_dataset(
+            self._tmp.name, SPEC, 3, h=H, w=W, series_depth=NUM_FRAMES, resample_mode="nearest"
         )
         self.model = make_tiny_encoder()
         self.adapter = VJepa21Adapter(
@@ -252,7 +252,7 @@ class ClassificationEvaluatorAgainstVJepaEncoderTest(unittest.TestCase):
     def _config(self, **overrides):
         config = {
             "seed": 3,
-            "split": {"train_fraction": 0.5, "val_fraction": 0.2, "test_fraction": 0.3},
+            "split": {"val_fraction": 0.3},
             "data": {"series_depth": NUM_FRAMES, "num_workers": 0},
             "logging": {"tensorboard_dir": None},
             "knn": {"k": [3], "batch_size": 4},
@@ -266,7 +266,7 @@ class ClassificationEvaluatorAgainstVJepaEncoderTest(unittest.TestCase):
         evaluator = ClassificationEvaluator(config=self._config(), adapter=self.adapter, dataset=self.dataset)
         for task in ("knn", "linear_pool", "attentive_pool"):
             metrics = evaluator.evaluate(self.model, tasks=[task], epoch=0)
-            self.assertTrue(any(k.startswith(task) for k in metrics))
+            self.assertTrue(any(k.startswith(f"external/{task}/") for k in metrics))
 
     def test_linear_task_dropped_without_cls_token(self):
         # V-JEPA 2.1 has no cls token; ClassificationEvaluator drops "linear"

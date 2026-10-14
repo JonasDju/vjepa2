@@ -58,7 +58,7 @@ def make_dataset(root):
                 Image.fromarray(arr, mode="L").save(d / f"{i:03d}.jpeg")
             meta[case_id][name] = {"dimensions": [H, W, n]}
     p = Path(root) / "metadata.json"
-    p.write_text(json.dumps(meta))
+    p.write_text(json.dumps({"train": meta}))  # KneeNo pretrains on the global splits "train" + "unlabeled"
     return str(p)
 
 

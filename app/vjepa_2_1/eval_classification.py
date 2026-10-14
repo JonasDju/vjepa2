@@ -10,9 +10,9 @@
 Loads a frozen encoder from a V-JEPA 2.1 pretraining checkpoint (as written by
 ``app/vjepa_2_1/train.py::save_checkpoint``) and hands it to
 ``kneeno.evaluation.ClassificationEvaluator``, which trains every head on the train split with
-early stopping on val and logs one point per task: its test metrics (the same protocol as the
-in-training hook in ``train.py``). With ``eval.verbose`` the per-head-epoch val metrics show the
-progress in the log.
+early stopping on val and logs one point per task and test set (``eval.data.test_sets``): its test
+metrics (the same protocol as the in-training hook in ``train.py``, which tests on ``internal`` only).
+With ``eval.verbose`` the per-head-epoch val metrics show the progress in the log.
 
 Usage::
 
@@ -22,8 +22,8 @@ Usage::
         --tasks knn linear_pool attentive_pool
 
 Use a standalone eval config like that one, not a pretraining config: those set
-``eval.data.abort_on_io_error: false``, which replaces an exam that fails to load with a random one,
-possibly from another split.
+``eval.data.abort_on_io_error: false``, which replaces an exam that fails to load with a random one
+(a val exam may become a train exam), and test on ``internal`` only.
 
 The official (RGB-pretrained) V-JEPA 2.1 checkpoints load the same way, as a baseline: set
 ``model.n_channels: 3`` (the grayscale volumes are repeated to a gray RGB video and normalized with

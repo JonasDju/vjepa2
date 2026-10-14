@@ -7,7 +7,7 @@ folder: /hpcwork/va105917/vjepa/pretrain_2_1/${SLURM_JOB_ID}.16p.24d.vitb.256px
 data:
   dataset_type: MIDataset
   data_root: /dev/shm/kneeno_data/internal
-  data_meta: /hpcwork/p0021834/workspace_roman/jonas/BigKneeTar/metadata_unlabeled.json
+  data_meta: /hpcwork/p0021834/workspace_roman/jonas/metadata/internal_unlabeled.json
   series_depth: 24
   resample_mode: nearest  # only used when series_depth > 0: "nearest" or "interpolate"
   batch_size: 48
@@ -142,28 +142,27 @@ eval:
   amp_dtype: bfloat16  # frozen-encoder forward under autocast (CUDA only); null -> float32. Heads still train in float32.
   cache_features: true  # linear / linear_pool train on embeddings extracted once per evaluation instead of
                         # re-encoding every head epoch; k-NN always uses the shared pass. attentive_pool never caches.
-  split:  # fractions of the labeled exams, each > 0, summing to 1
-    train_fraction: 0.7
-    val_fraction: 0.1  # heads are scored on val every head epoch (early stopping)
-    test_fraction: 0.2  # scored once with each head's best val epoch; the reported numbers
+  split:  # the internal global "train" split (pretrained on) is cut into train and val; the test sets are used whole
+    val_fraction: 0.2  # heads are scored on val every head epoch (early stopping)
   training:
     early_stop_on: auroc  # val metric that picks each head's best epoch
     early_stop_patience: 5  # head epochs without a val improvement before stopping; 0 = never stop early
   verbose: true  # log each task's start and every head epoch's val metrics
   data:
-    data_root: /dev/shm/kneeno_data/internal
-    label_meta: /hpcwork/p0021834/workspace_roman/jonas/BigKneeTar/metadata_labeled.json
-    dataset_type: internal  # internal | external | mixed (mixed: data_root and label_meta as {internal: ..., external: ...})
+    # internal: global "train" (the heads' train/val) + "val" (the "internal" test set, never pretrained on)
+    data_root: {internal: /dev/shm/kneeno_data/internal}
+    label_meta: {internal: /hpcwork/p0021834/workspace_roman/jonas/metadata/internal_labeled.json}
+    test_sets: [internal]  # in-training: never external (that is for the final numbers, not for picking checkpoints)
     series_depth: 24  # match the series_depth above -- no resampling distribution shift
     resample_mode: nearest
     num_workers: 16
-    subset: 12500  # seeded subsample of the labeled EXAMS: float in (0, 1] = fraction, int > 1 = count, 1.0 = all
-    abort_on_io_error: false  # a broken exam is replaced by a random other one (maybe of another split) instead of killing the run
+    subset: 12500  # seeded subsample of the internal "train" EXAMS (test sets always whole): float in (0, 1] = fraction, int > 1 = count, 1.0 = all
+    abort_on_io_error: false  # a broken exam is replaced by a random other one of its part (a val exam may become a train exam) instead of killing the run
     multiprocessing_context: fork  # eval DataLoader worker start method; null -> inherit. Workers must never touch CUDA
     persistent_workers: true  # keep workers alive across head epochs (ignored when num_workers = 0)
   logging:
-    tensorboard_dir: /hpcwork/va105917/vjepa/pretrain_2_1/${SLURM_JOB_ID}.16p.24d.vitb.256px/eval/internal/in-training/tb
-    per_label_dir: /hpcwork/va105917/vjepa/pretrain_2_1/${SLURM_JOB_ID}.16p.24d.vitb.256px/eval/internal/in-training/eval_per_label
+    tensorboard_dir: /hpcwork/va105917/vjepa/pretrain_2_1/${SLURM_JOB_ID}.16p.24d.vitb.256px/eval/in-training/tb
+    per_label_dir: /hpcwork/va105917/vjepa/pretrain_2_1/${SLURM_JOB_ID}.16p.24d.vitb.256px/eval/in-training/eval_per_label
     tag_prefix: eval
   freq:
     knn: 10

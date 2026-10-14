@@ -36,9 +36,12 @@ H, W = 20, 24
 # are built with them and the configs omit both keys, so the tests exercise the defaults
 QK_NORM_AFFINE = False
 QK_TEMPERATURE_MAX = 4.0
-# labeled (evaluation) data: two series of different depth per patient -> resampled to NUM_FRAMES
-SPEC = full_exam_spec(10, INTERNAL_SEQUENCES)  # 10 complete exams
-EXTERNAL_SPEC = full_exam_spec(10, EXTERNAL_SEQUENCES)
+# labeled (evaluation) data: the sequences have different depths -> resampled to NUM_FRAMES.
+# Internal: 7 exams in the global split "train" (the train part) and 3 in "val" (the "internal" test set).
+SPEC = full_exam_spec(10, INTERNAL_SEQUENCES, prefix="i")
+VAL_CASES = {f"i{i}": "val" for i in range(7, 10)}
+# External: 4 exams, all in "test" (the "external" test set); case ids distinct from the internal ones.
+EXTERNAL_SPEC = full_exam_spec(4, EXTERNAL_SEQUENCES, prefix="e")
 
 
 class EvalClassificationCliTest(unittest.TestCase):
@@ -48,15 +51,19 @@ class EvalClassificationCliTest(unittest.TestCase):
         self.root = Path(self._tmp.name)
         self._make_checkpoint()
 
-    def _make_datasets(self, labeled_spec, dataset_type="internal"):
+    def _make_datasets(self):
         """Labeled data for the eval block (the script never loads pretraining volumes).
 
-        The script lets ``ClassificationEvaluator`` build its own dataset, so the layout must match
-        ``eval.data.dataset_type`` (see ``_make_config``): JPEG slices for ``"internal"``, NIfTI for ``"external"``.
+        The script lets ``ClassificationEvaluator`` build its own dataset from ``eval.data`` (see ``_make_config``):
+        the internal JPEG slices (train part + ``internal`` test set) and the external NIfTIs (``external`` test set).
         """
-        self.labeled_root = self.root / f"labeled_{dataset_type}"
-        make = make_internal_labeled_dataset if dataset_type == "internal" else make_labeled_dataset
-        self.labeled_meta_path = Path(make(self.labeled_root, labeled_spec, h=H, w=W))
+        self.data_root = {source: str(self.root / f"labeled_{source}") for source in ("internal", "external")}
+        self.label_meta = {
+            "internal": make_internal_labeled_dataset(
+                self.data_root["internal"], SPEC, h=H, w=W, case_splits=VAL_CASES
+            ),
+            "external": make_labeled_dataset(self.data_root["external"], EXTERNAL_SPEC, h=H, w=W),
+        }
 
     def _make_checkpoint(self, in_chans=1, qk_norm="rms"):
         encoder, predictor = init_video_model(
@@ -106,9 +113,10 @@ class EvalClassificationCliTest(unittest.TestCase):
         torch.save(checkpoint, self.checkpoint_path)
         return ema_state
 
-    def _make_config(self, series_depth, n_channels=None, qk_norm="rms", dataset_type="internal"):
+    def _make_config(self, series_depth, n_channels=None, qk_norm="rms", test_sets=("internal",)):
         # data: only holds the encoder's architecture; its depth is eval.data.series_depth
-        self.tb_dir = self.root / f"tb_{dataset_type}"
+        self.test_sets = list(test_sets)
+        self.tb_dir = self.root / f"tb_{'_'.join(test_sets)}"
         config = {
             "data": {
                 "patch_size": PATCH_SIZE,
@@ -125,11 +133,11 @@ class EvalClassificationCliTest(unittest.TestCase):
             },
             "eval": {
                 "seed": 1,
-                "split": {"train_fraction": 0.5, "val_fraction": 0.2, "test_fraction": 0.3},
+                "split": {"val_fraction": 0.3},
                 "data": {
-                    "data_root": str(self.labeled_root),
-                    "label_meta": str(self.labeled_meta_path),
-                    "dataset_type": dataset_type,
+                    "data_root": self.data_root,
+                    "label_meta": self.label_meta,
+                    "test_sets": self.test_sets,
                     "series_depth": series_depth,
                     "batch_size": 4,
                     "num_workers": 0,
@@ -150,28 +158,28 @@ class EvalClassificationCliTest(unittest.TestCase):
         self.config_path.write_text(yaml.dump(config))
 
     def test_cli_runs_and_logs_one_test_point_per_task(self):
-        self._make_datasets(SPEC)
+        self._make_datasets()
         self._make_config(series_depth=NUM_FRAMES)
         self._run_and_check_tensorboard()
 
-    def test_dataset_type_selects_the_dataset_and_the_adapters_preprocessing(self):
+    def test_test_sets_select_the_datasets_and_the_adapters_preprocessing(self):
         # The fixtures' layouts differ (JPEG slices vs NIfTI), so a run only succeeds if the evaluator built the
-        # dataset eval.data.dataset_type names. The adapter learns each volume's source from the dataset's items:
+        # datasets eval.data.test_sets names. The adapter learns each volume's source from the dataset's items:
         # only external volumes are quantized (num_workers is 0, so the spy sees every call).
-        for dataset_type, spec in (("internal", SPEC), ("external", EXTERNAL_SPEC)):
-            with self.subTest(dataset_type=dataset_type):
-                self._make_datasets(spec, dataset_type=dataset_type)
-                self._make_config(series_depth=NUM_FRAMES, dataset_type=dataset_type)
+        self._make_datasets()
+        for test_sets in (["internal"], ["internal", "external"]):
+            with self.subTest(test_sets=test_sets):
+                self._make_config(series_depth=NUM_FRAMES, test_sets=test_sets)
                 with mock.patch.object(
                     LabeledExternalKneeMRIDataset, "to_uint8", wraps=LabeledExternalKneeMRIDataset.to_uint8
                 ) as to_uint8:
                     self._run_and_check_tensorboard()
-                self.assertEqual(to_uint8.called, dataset_type == "external")
+                self.assertEqual(to_uint8.called, "external" in test_sets)
 
     def test_native_depth_is_rejected_up_front(self):
         # V-JEPA 2.1 has no native-depth mode: the encoder is sized for eval.data.series_depth and
         # VJepa21Adapter keeps whatever depth it gets, so it must be > 0.
-        self._make_datasets(SPEC)
+        self._make_datasets()
         for series_depth in (0, -1, None):
             with self.subTest(series_depth=series_depth):
                 self._make_config(series_depth=series_depth)
@@ -186,7 +194,7 @@ class EvalClassificationCliTest(unittest.TestCase):
         # only exists with a q/k norm) shows that the q/k options reached the model.
         from app.vjepa_2_1.eval_classification import build_encoder, load_frozen_encoder
 
-        self._make_datasets(SPEC)
+        self._make_datasets()
         self._make_config(series_depth=NUM_FRAMES)
         config = yaml.safe_load(self.config_path.read_text())
         encoder = build_encoder(config["data"], config["model"], 1, NUM_FRAMES, torch.device("cpu"))
@@ -202,7 +210,7 @@ class EvalClassificationCliTest(unittest.TestCase):
     def test_cli_runs_on_official_rgb_checkpoint(self):
         # n_channels: 3 -> RGB encoder, volumes repeated to 3 channels; target -> the official "ema_encoder"
         self._make_official_checkpoint()
-        self._make_datasets(SPEC)
+        self._make_datasets()
         self._make_config(series_depth=NUM_FRAMES, n_channels=3, qk_norm="none")
         self._run_and_check_tensorboard()
 
@@ -214,7 +222,7 @@ class EvalClassificationCliTest(unittest.TestCase):
         )
 
         ema_state = self._make_official_checkpoint()
-        self._make_datasets(SPEC)
+        self._make_datasets()
         self._make_config(series_depth=NUM_FRAMES, n_channels=3, qk_norm="none")
         config = yaml.safe_load(self.config_path.read_text())
         encoder = build_encoder(config["data"], config["model"], 3, NUM_FRAMES, torch.device("cpu"))
@@ -225,7 +233,7 @@ class EvalClassificationCliTest(unittest.TestCase):
     def test_missing_encoder_key_raises(self):
         from app.vjepa_2_1.eval_classification import build_encoder, load_frozen_encoder
 
-        self._make_datasets(SPEC)
+        self._make_datasets()
         self._make_config(series_depth=NUM_FRAMES)
         config = yaml.safe_load(self.config_path.read_text())
         encoder = build_encoder(config["data"], config["model"], 1, NUM_FRAMES, torch.device("cpu"))
@@ -262,9 +270,10 @@ class EvalClassificationCliTest(unittest.TestCase):
         ea = EventAccumulator(str(self.tb_dir))
         ea.Reload()
         tags = ea.Tags()["scalars"]
-        self.assertTrue(any(t.startswith("eval/knn") for t in tags))
-        self.assertTrue(any(t.startswith("eval/linear_pool") for t in tags))
-        self.assertTrue(any(t.startswith("eval/attentive_pool") for t in tags))
+        for test_set in self.test_sets:
+            for task in ("knn", "linear_pool", "attentive_pool"):
+                self.assertTrue(any(t.startswith(f"eval/{test_set}/{task}/") for t in tags), (test_set, task))
+        self.assertIn("eval/evaluation_val/linear_pool/val_auroc", tags)
         for tag in tags:
             # Only the test metrics are logged, once per task, however many head epochs ran.
             self.assertEqual([e.step for e in ea.Scalars(tag)], [0], tag)

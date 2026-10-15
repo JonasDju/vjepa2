@@ -5,6 +5,15 @@
 
 import os
 
+# Must be set before torch is imported (by app.scaffold below), and is inherited by the spawned rank processes.
+# torch otherwise runs CPU ops on one OpenMP thread per CPU in the job's affinity mask. With as many spinning
+# threads as CPUs, any other busy thread (the other ranks waiting in KneeNo's barrier, DataLoader workers)
+# deschedules one of them and every parallel region waits for it: the in-training eval's CPU-side work on cached
+# features (batch gathering, metrics) ran ~50x slower with all CPUs at 100%. The training loop has no heavy CPU
+# tensor ops, and DataLoader workers already run torch single-threaded. Forced, not setdefault, as in
+# lightly-train: the cluster's job environment may set OMP_NUM_THREADS itself.
+os.environ["OMP_NUM_THREADS"] = "1"
+
 # Expandable segments let freed memory be reused for any size. setdefault, so an explicit setting in the job
 # environment wins.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -56,6 +65,13 @@ def process_main(rank, fname, world_size, devices):
         logger.setLevel(logging.ERROR)
 
     logger.info(f"called-params {fname}")
+
+    import torch
+
+    logger.info(
+        f"CPU threads: torch={torch.get_num_threads()} OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS')} "
+        f"affinity={len(os.sched_getaffinity(0))} CPUs"
+    )
 
     # Load config
     params = None

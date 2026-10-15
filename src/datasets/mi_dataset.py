@@ -5,14 +5,10 @@
 
 """V-JEPA 2.1 adapter around the model-agnostic knee-MRI dataset in KneeNo.
 
-Volume loading, metadata parsing, depth resampling and the depth-bucket sampler
-live in the ``kneeno`` package so the DINOv2 side can reuse them. This module
+Volume loading, metadata parsing and depth resampling live in the ``kneeno``
+package so the DINOv2 side can reuse them. This module
 only adds the V-JEPA sample format ``(buffer, label, clip_indices)`` and applies
 the V-JEPA video transform.
-
-``get_series_depths`` and ``DistributedDepthBucketSampler`` are re-exported here
-so existing imports (``app/vjepa_2_1/train.py``, ``src/datasets/data_manager.py``)
-keep working unchanged.
 """
 
 from logging import getLogger
@@ -20,28 +16,33 @@ from logging import getLogger
 import numpy as np
 import torch
 
-from kneeno.dataset import UnlabeledKneeMRIDataset, get_series_depths  # noqa: F401
-from kneeno.sampler import DistributedDepthBucketSampler  # noqa: F401
+from kneeno.dataset import UnlabeledKneeMRIDataset
 
-logger = getLogger()
+logger = getLogger(__name__)
 
 
 class MIDataset(torch.utils.data.Dataset):
     """Wrap ``kneeno.UnlabeledKneeMRIDataset`` to yield V-JEPA training samples.
 
-    Item shape mirrors ``VideoDataset``: ``([tensor (1, T, H, W)], 0, [arange(T)])``.
+    Item shape mirrors ``VideoDataset``: ``([tensor (1, D, H, W)], 0, [arange(D)])``
+    (``D`` = depth, i.e. the number of slices -- treated as video frames here).
+
+    ``series_depth`` must be positive: every volume is resampled to that many slices, because
+    ``MaskCollator`` only handles the frame counts in ``dataset_fpcs`` (``[series_depth]``) and
+    a batch has to stack.
     """
 
     def __init__(
         self,
         data_root,
         data_meta,
+        series_depth,
         transform=None,
-        series_depth=0,
         resample_mode="nearest",
         min_series_len=2,
         max_series_len=None,
     ):
+        check_series_depth(series_depth)
         self._core = UnlabeledKneeMRIDataset(
             data_root=data_root,
             data_meta=data_meta,
@@ -55,28 +56,38 @@ class MIDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self._core)
 
-    def effective_depth(self, index):
-        return self._core.effective_depth(index)
-
     def __getitem__(self, index):
-        # (T, H, W, 1) ndarray -- the same array the old loader passed to the transform.
-        vol = self._core[index].numpy()
+        # kneeno now returns channel-first (1, D, H, W); flip it back to the
+        # channel-last (D, H, W, 1) layout that VideoTransform (shared with the
+        # genuine video / ImageNet paths, must not be modified) expects. This
+        # makes the pre-transform array byte-for-byte what the old loader passed
+        # in -- do not "simplify" this flip away.
+        vol = self._core[index].numpy()[0, ..., None]  # (1, D, H, W) -> (D, H, W, 1)
         depth = vol.shape[0]
         buffer = vol
         if self.transform is not None:
-            buffer = self.transform(buffer)  # (1, T, H, W) float tensor
+            buffer = self.transform(buffer)  # (1, D, H, W) float tensor
         buffer = [buffer]
         label = 0
         clip_indices = [np.arange(depth, dtype=np.int64)]
         return buffer, label, clip_indices
 
 
+def check_series_depth(series_depth, key="data.series_depth"):
+    """Raise unless ``series_depth`` is a positive int (V-JEPA 2.1 has no native-depth mode)."""
+    if isinstance(series_depth, bool) or not isinstance(series_depth, int) or series_depth <= 0:
+        raise ValueError(
+            f"{key} must be a positive number of slices for V-JEPA 2.1, got {series_depth!r}; "
+            "native per-series depth (<= 0) is not supported"
+        )
+
+
 def make_MIDataset(
     data_root,
     data_meta,
     batch_size,
+    series_depth,
     transform=None,
-    series_depth=0,
     resample_mode="nearest",
     rank=0,
     world_size=1,
@@ -100,39 +111,19 @@ def make_MIDataset(
         max_series_len=max_series_len,
     )
 
-    use_persistent = (num_workers > 0) and persistent_workers
-
-    if series_depth and series_depth > 0:
-        dist_sampler = torch.utils.data.distributed.DistributedSampler(
-            dataset, num_replicas=world_size, rank=rank, shuffle=True
-        )
-        data_loader = torch.utils.data.DataLoader(
-            dataset,
-            collate_fn=collator,
-            sampler=dist_sampler,
-            batch_size=batch_size,
-            drop_last=drop_last,
-            pin_memory=pin_mem,
-            num_workers=num_workers,
-            persistent_workers=use_persistent,
-        )
-    else:
-        dist_sampler = DistributedDepthBucketSampler(
-            depths_per_index=[dataset.effective_depth(i) for i in range(len(dataset))],
-            batch_size=batch_size,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True,
-            drop_last=drop_last,
-        )
-        data_loader = torch.utils.data.DataLoader(
-            dataset,
-            collate_fn=collator,
-            batch_sampler=dist_sampler,
-            pin_memory=pin_mem,
-            num_workers=num_workers,
-            persistent_workers=use_persistent,
-        )
+    dist_sampler = torch.utils.data.distributed.DistributedSampler(
+        dataset, num_replicas=world_size, rank=rank, shuffle=True
+    )
+    data_loader = torch.utils.data.DataLoader(
+        dataset,
+        collate_fn=collator,
+        sampler=dist_sampler,
+        batch_size=batch_size,
+        drop_last=drop_last,
+        pin_memory=pin_mem,
+        num_workers=num_workers,
+        persistent_workers=(num_workers > 0) and persistent_workers,
+    )
 
     logger.info("MIDataset unsupervised data loader created")
     return dataset, data_loader, dist_sampler

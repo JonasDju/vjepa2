@@ -13,9 +13,9 @@ from pathlib import Path
 
 import submitit
 import yaml
+from kneeno.config import expand_env_vars
 
 from app.scaffold import main as app_main
-from src.utils.config import expand_env_vars
 from src.utils.logging import get_logger, git_information
 
 logger = get_logger(force=True)

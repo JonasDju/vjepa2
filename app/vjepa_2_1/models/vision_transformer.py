@@ -55,6 +55,8 @@ class VisionTransformer(nn.Module):
         modality_embedding=True,
         n_output_distillation=4,
         qk_norm="none",
+        qk_norm_affine=True,
+        qk_temperature_max=None,
         **kwargs,
     ):
         super().__init__()
@@ -136,6 +138,8 @@ class VisionTransformer(nn.Module):
                     interpolate_rope=interpolate_rope,
                     patch_size=patch_size,
                     qk_norm=qk_norm,
+                    qk_norm_affine=qk_norm_affine,
+                    qk_temperature_max=qk_temperature_max,
                 )
                 for i in range(depth)
             ]
@@ -192,8 +196,10 @@ class VisionTransformer(nn.Module):
 
     def _init_weights(self, m):
         if isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
+            if m.bias is not None:  # None for a non-affine q/k LayerNorm
+                nn.init.constant_(m.bias, 0)
+            if m.weight is not None:
+                nn.init.constant_(m.weight, 1.0)
             return
         if self.init_type == "default":
             if isinstance(m, nn.Linear):

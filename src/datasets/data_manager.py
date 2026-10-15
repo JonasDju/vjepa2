@@ -39,7 +39,7 @@ def init_data(
     log_dir=None,
     data_root=None,
     data_meta=None,
-    series_depth=0,
+    series_depth=None,
     resample_mode="nearest",
 ):
     if data.lower() == "imagenet":

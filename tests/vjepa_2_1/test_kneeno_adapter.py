@@ -1,0 +1,280 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""CPU checks for the KneeNo <-> V-JEPA 2.1 bridge.
+
+Builds a tiny real ``VisionTransformer`` (not a mock) so this exercises the
+actual patch-embedding / forward path, not just the adapter's own logic.
+``depth=12`` is required by a quirk of ``VisionTransformer.__init__``
+(``hierarchical_layers`` is only populated for depth in {12, 24, 40, 48}).
+"""
+
+import tempfile
+import unittest
+
+import numpy as np
+import torch
+
+import app.vjepa_2_1.models.vision_transformer as video_vit
+from app.vjepa_2_1.train import NORMALIZE_MI, NORMALIZE_RGB
+from app.vjepa_2_1.utils import init_video_model
+from app.vjepa_2_1.wrappers import MultiSeqWrapper
+from kneeno import ClassificationEvaluator, LabeledExternalKneeMRIDataset
+from src.datasets.kneeno_adapter import VJepa21Adapter
+from tests.vjepa_2_1.labeled_fixture import EXTERNAL_SEQUENCES, full_exam_spec, make_eval_dataset
+
+H, W = 20, 24
+SPEC = full_exam_spec(10, EXTERNAL_SEQUENCES)  # 10 complete exams
+
+EMBED_DIM = 16
+CROP_SIZE = 32
+PATCH_SIZE = 8
+TUBELET_SIZE = 2
+NUM_FRAMES = 4
+
+
+def make_tiny_encoder():
+    backbone = video_vit.VisionTransformer(
+        img_size=CROP_SIZE,
+        patch_size=PATCH_SIZE,
+        num_frames=NUM_FRAMES,
+        tubelet_size=TUBELET_SIZE,
+        in_chans=1,
+        embed_dim=EMBED_DIM,
+        depth=12,
+        num_heads=2,
+        use_rope=True,
+        modality_embedding=True,
+    )
+    model = MultiSeqWrapper(backbone)
+    model.eval()
+    return model
+
+
+class VJepa21AdapterTest(unittest.TestCase):
+    def setUp(self):
+        self.adapter = VJepa21Adapter(
+            embed_dim=EMBED_DIM, crop_size=CROP_SIZE, normalize=((0.5,), (0.5,))
+        )
+        rng = np.random.default_rng(0)
+        self.volume = torch.from_numpy(
+            rng.integers(0, 256, size=(1, NUM_FRAMES, H, W), dtype=np.uint8)
+        )
+
+    def test_prepare_input_shape_and_dtype(self):
+        prepped = self.adapter.prepare_input(self.volume, source="internal")
+        self.assertEqual(tuple(prepped.shape), (1, NUM_FRAMES, CROP_SIZE, CROP_SIZE))
+        self.assertEqual(prepped.dtype, torch.float32)
+
+    def test_collate_stacks_batch_axis(self):
+        prepped = [self.adapter.prepare_input(self.volume, source="internal") for _ in range(3)]
+        batch = self.adapter.collate(prepped)
+        self.assertEqual(tuple(batch.shape), (3, 1, NUM_FRAMES, CROP_SIZE, CROP_SIZE))
+
+    def test_forward_features_against_real_encoder(self):
+        model = make_tiny_encoder()
+        batch = self.adapter.collate([self.adapter.prepare_input(self.volume, source="internal") for _ in range(2)])
+        with torch.no_grad():
+            out = self.adapter.forward_features(model, batch)
+
+        self.assertIsNone(out["cls"])
+        n_temporal = NUM_FRAMES // TUBELET_SIZE
+        n_spatial = CROP_SIZE // PATCH_SIZE
+        expected_n = n_temporal * n_spatial * n_spatial
+        self.assertEqual(tuple(out["patches"].shape), (2, expected_n, EMBED_DIM))
+
+    def test_has_no_cls_token(self):
+        self.assertFalse(self.adapter.has_cls_token)
+
+
+class RepeatedChannelsTest(unittest.TestCase):
+    """n_channels > 1: the grayscale volume becomes a gray "RGB video" for the official checkpoints."""
+
+    def setUp(self):
+        rng = np.random.default_rng(0)
+        self.volume = torch.from_numpy(rng.integers(0, 256, size=(1, NUM_FRAMES, H, W), dtype=np.uint8))
+
+    def test_repeats_before_per_channel_normalization(self):
+        # each channel must be the gray volume normalized with *that* channel's mean/std -- identical to
+        # the 1-channel path run with the channel's (mean, std) alone
+        rgb = VJepa21Adapter(
+            embed_dim=EMBED_DIM, n_channels=3, crop_size=CROP_SIZE, normalize=NORMALIZE_RGB
+        )
+        prepped = rgb.prepare_input(self.volume, source="internal")
+        self.assertEqual(tuple(prepped.shape), (3, NUM_FRAMES, CROP_SIZE, CROP_SIZE))
+        self.assertTrue(prepped.is_contiguous())
+        for c, (mean, std) in enumerate(zip(*NORMALIZE_RGB)):
+            gray = VJepa21Adapter(
+                embed_dim=EMBED_DIM, crop_size=CROP_SIZE, normalize=((mean,), (std,))
+            )
+            torch.testing.assert_close(prepped[c], gray.prepare_input(self.volume, source="internal")[0])
+        self.assertFalse(torch.equal(prepped[0], prepped[1]))
+
+    def test_single_normalization_shared_by_all_channels(self):
+        adapter = VJepa21Adapter(
+            embed_dim=EMBED_DIM, n_channels=3, crop_size=CROP_SIZE, normalize=NORMALIZE_MI
+        )
+        prepped = adapter.prepare_input(self.volume, source="internal")
+        self.assertEqual(prepped.shape[0], 3)
+        self.assertTrue(torch.equal(prepped[0], prepped[1]) and torch.equal(prepped[1], prepped[2]))
+
+    def test_rejects_normalization_for_another_channel_count(self):
+        # 1-channel adapter + RGB normalize used to broadcast the volume to 3 channels silently
+        with self.assertRaises(ValueError):
+            VJepa21Adapter(
+                embed_dim=EMBED_DIM,
+                n_channels=1,
+                crop_size=CROP_SIZE,
+                normalize=NORMALIZE_RGB,
+            )
+        with self.assertRaises(ValueError):
+            VJepa21Adapter(
+                embed_dim=EMBED_DIM,
+                n_channels=2,
+                crop_size=CROP_SIZE,
+                normalize=NORMALIZE_RGB,
+            )
+
+    def test_rejects_multichannel_input(self):
+        adapter = VJepa21Adapter(
+            embed_dim=EMBED_DIM, n_channels=3, crop_size=CROP_SIZE, normalize=NORMALIZE_RGB
+        )
+        with self.assertRaises(ValueError):
+            adapter.prepare_input(self.volume.repeat(3, 1, 1, 1), source="internal")
+
+    def test_forward_through_rgb_encoder(self):
+        encoder, _ = init_video_model(
+            device=torch.device("cpu"),
+            patch_size=PATCH_SIZE,
+            max_num_frames=NUM_FRAMES,
+            tubelet_size=TUBELET_SIZE,
+            in_chans=3,
+            model_name="vit_tiny",
+            crop_size=CROP_SIZE,
+            pred_depth=12,
+            pred_embed_dim=32,
+            use_rope=True,
+            modality_embedding=True,
+        )
+        encoder.eval()
+        adapter = VJepa21Adapter(
+            embed_dim=encoder.embed_dim,
+            n_channels=3,
+            crop_size=CROP_SIZE,
+            normalize=NORMALIZE_RGB,
+        )
+        batch = adapter.collate([adapter.prepare_input(self.volume, source="internal") for _ in range(2)])
+        self.assertEqual(tuple(batch.shape), (2, 3, NUM_FRAMES, CROP_SIZE, CROP_SIZE))
+        with torch.no_grad():
+            out = adapter.forward_features(encoder, batch)
+        n_tokens = (NUM_FRAMES // TUBELET_SIZE) * (CROP_SIZE // PATCH_SIZE) ** 2
+        self.assertEqual(tuple(out["patches"].shape), (2, n_tokens, encoder.embed_dim))
+
+
+class ExternalPreprocessingTest(unittest.TestCase):
+    """``source="external"``: the raw NIfTI volume is first quantized the way the internal JPEGs were
+    (``LabeledExternalKneeMRIDataset.to_uint8``); everything after that is the internal path."""
+
+    def test_external_volume_is_prepared_like_its_uint8_version(self):
+        rng = np.random.default_rng(0)
+        for dtype in (np.int16, np.uint16, np.float32):  # the dtypes the external NIfTIs come in
+            with self.subTest(dtype=dtype.__name__):
+                raw = torch.from_numpy((rng.random((1, NUM_FRAMES, H, W)) * 1000).astype(dtype))
+                kwargs = dict(embed_dim=EMBED_DIM, crop_size=CROP_SIZE, normalize=((0.5,), (0.5,)))
+                quantized = torch.from_numpy(LabeledExternalKneeMRIDataset.to_uint8(raw.numpy()))
+                adapter = VJepa21Adapter(**kwargs)
+                expected = adapter.prepare_input(quantized, source="internal")
+                out = adapter.prepare_input(raw, source="external")
+                torch.testing.assert_close(out, expected)
+
+
+    def test_unknown_source_raises(self):
+        # Anything but "external" would otherwise silently take the internal path.
+        adapter = VJepa21Adapter(embed_dim=EMBED_DIM, crop_size=CROP_SIZE)
+        volume = torch.zeros(1, NUM_FRAMES, H, W, dtype=torch.uint8)
+        for source in (None, "External", "nifti", "mixed"):
+            with self.subTest(source=source), self.assertRaisesRegex(ValueError, "source"):
+                adapter.prepare_input(volume, source=source)
+
+
+class InitVideoModelCompatibilityTest(unittest.TestCase):
+    """The adapter must work against train.py's actual encoder factory
+    (init_video_model), not just a hand-built VisionTransformer."""
+
+    def test_encoder_from_init_video_model_is_adapter_compatible(self):
+        encoder, _ = init_video_model(
+            device=torch.device("cpu"),
+            patch_size=PATCH_SIZE,
+            max_num_frames=NUM_FRAMES,
+            tubelet_size=TUBELET_SIZE,
+            in_chans=1,
+            model_name="vit_tiny",
+            crop_size=CROP_SIZE,
+            pred_depth=12,  # pred_depth must be in {12,24,40,48}, same quirk as the encoder
+            pred_embed_dim=32,
+            use_rope=True,
+            modality_embedding=True,
+        )
+        encoder.eval()
+        adapter = VJepa21Adapter(
+            embed_dim=encoder.embed_dim, crop_size=CROP_SIZE, normalize=((0.5,), (0.5,))
+        )
+
+        rng = np.random.default_rng(0)
+        volume = torch.from_numpy(rng.integers(0, 256, size=(1, NUM_FRAMES, H, W), dtype=np.uint8))
+        batch = adapter.collate([adapter.prepare_input(volume, source="internal") for _ in range(2)])
+
+        with torch.no_grad():
+            out = adapter.forward_features(encoder, batch)
+
+        self.assertIsNone(out["cls"])
+        self.assertEqual(out["patches"].shape[0], 2)
+        self.assertEqual(out["patches"].shape[2], encoder.embed_dim)
+
+
+class ClassificationEvaluatorAgainstVJepaEncoderTest(unittest.TestCase):
+    """End-to-end: real (tiny) encoder + real adapter through KneeNo's evaluator."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        # 7 train-part exams (5 train / 2 val with the split below) and the 3-exam test set "external"
+        self.dataset = make_eval_dataset(
+            self._tmp.name, SPEC, 3, h=H, w=W, series_depth=NUM_FRAMES, resample_mode="nearest"
+        )
+        self.model = make_tiny_encoder()
+        self.adapter = VJepa21Adapter(
+            embed_dim=EMBED_DIM, crop_size=CROP_SIZE, normalize=((0.5,), (0.5,))
+        )
+
+    def _config(self, **overrides):
+        config = {
+            "seed": 3,
+            "split": {"val_fraction": 0.3},
+            "data": {"series_depth": NUM_FRAMES, "num_workers": 0},
+            "logging": {"tensorboard_dir": None},
+            "knn": {"k": [3], "batch_size": 4},
+            "linear_pool": {"max_epochs": 1, "batch_size": 4},
+            "attentive_pool": {"max_epochs": 1, "batch_size": 4, "num_heads": 4},
+        }
+        config.update(overrides)
+        return config
+
+    def test_knn_and_pooled_heads_run(self):
+        evaluator = ClassificationEvaluator(config=self._config(), adapter=self.adapter, dataset=self.dataset)
+        for task in ("knn", "linear_pool", "attentive_pool"):
+            metrics = evaluator.evaluate(self.model, tasks=[task], epoch=0)
+            self.assertTrue(any(k.startswith(f"external/{task}/") for k in metrics))
+
+    def test_linear_task_dropped_without_cls_token(self):
+        # V-JEPA 2.1 has no cls token; ClassificationEvaluator drops "linear"
+        # with a warning rather than raising (see kneeno/evaluation/classification.py).
+        evaluator = ClassificationEvaluator(config=self._config(), adapter=self.adapter, dataset=self.dataset)
+        metrics = evaluator.evaluate(self.model, tasks=["linear"], epoch=0)
+        self.assertEqual(metrics, {})
+
+
+if __name__ == "__main__":
+    unittest.main()

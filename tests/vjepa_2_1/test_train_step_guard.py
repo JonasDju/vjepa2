@@ -12,6 +12,12 @@ the optimizer step and the target-EMA update are both skipped, ``optimizer.zero_
 still runs, and the EMA momentum schedule still advances. A separate replica covers the
 consecutive-skip counter that aborts the run after ``MAX_CONSECUTIVE_NONFINITE`` skips
 in a row.
+
+Also covers the other extractable step-region pieces: ``clip_gradients``
+(``optimization.gradient_clipping``, applied between the norm probe and the optimizer step),
+``check_optimization_config`` (``gradient_clipping`` / ``betas`` validation),
+``apply_optimizer_hparams`` (the configured betas/eps win over a resumed optimizer state) and
+``qk_temperature_summary`` (the epoch-end temperature log line).
 """
 
 import unittest
@@ -20,21 +26,31 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from app.vjepa_2_1.train import MAX_CONSECUTIVE_NONFINITE, compute_grad_norm
+from app.vjepa_2_1.models.utils.modules import Attention
+from app.vjepa_2_1.train import (
+    MAX_CONSECUTIVE_NONFINITE,
+    check_optimization_config,
+    clip_gradients,
+    compute_grad_norm,
+    qk_temperature_summary,
+)
+from app.vjepa_2_1.utils import apply_optimizer_hparams
 
 
 def _ema_schedule(m=0.99, n=1000):
     return (m for _ in range(n))
 
 
-def _apply_guarded_step(online, target, optimizer, momentum_scheduler, poison=None):
-    """Replica of the train.py step region: backward, grad-norm probe, guard, EMA.
+def _apply_guarded_step(online, target, optimizer, momentum_scheduler, poison=None, max_norm=None):
+    """Replica of the train.py step region: backward, grad-norm probe, guard, clip, EMA.
 
     Mirrors ``train.py``:
         loss.backward()
         grad_norm = compute_grad_norm(enc_params + pred_params)
         grads_finite = bool(np.isfinite(grad_norm))
-        if grads_finite: optimizer.step()
+        if grads_finite:
+            clip_gradients(enc_params + pred_params, gradient_clipping, grad_norm)
+            optimizer.step()
         optimizer.zero_grad()
         m = next(momentum_scheduler)            # advances every iter
         if run_step and grads_finite: <EMA update>
@@ -52,6 +68,7 @@ def _apply_guarded_step(online, target, optimizer, momentum_scheduler, poison=No
     grads_finite = bool(np.isfinite(grad_norm))
 
     if grads_finite:
+        clip_gradients(list(online.parameters()), max_norm, grad_norm)
         optimizer.step()
     optimizer.zero_grad()
 
@@ -203,6 +220,123 @@ class ConsecutiveNonFiniteAbortTest(unittest.TestCase):
     def test_isolated_skips_never_trip(self):
         seq = [True, False, True, False, False, True] * 50
         self.assertEqual(_run_with_consecutive_guard(seq), len(seq))
+
+
+def _grads_of(mod):
+    return [p.grad.clone() for p in mod.parameters()]
+
+
+class ClipGradientsTest(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(0)
+        self.mod = nn.Sequential(nn.Linear(4, 6), nn.Tanh(), nn.Linear(6, 4))
+        (self.mod(torch.randn(8, 4)) ** 2).sum().backward()
+        self.params = list(self.mod.parameters())
+        self.norm = compute_grad_norm(self.params)
+
+    def test_disabled_is_a_no_op(self):
+        before = _grads_of(self.mod)
+        self.assertFalse(clip_gradients(self.params, None, self.norm))
+        for b, p in zip(before, self.params):
+            self.assertTrue(torch.equal(b, p.grad))
+
+    def test_below_max_is_a_no_op(self):
+        before = _grads_of(self.mod)
+        self.assertFalse(clip_gradients(self.params, 2 * self.norm, self.norm))
+        for b, p in zip(before, self.params):
+            self.assertTrue(torch.equal(b, p.grad))
+
+    def test_above_max_rescales_to_max(self):
+        max_norm = self.norm / 4
+        before = _grads_of(self.mod)
+        self.assertTrue(clip_gradients(self.params, max_norm, self.norm))
+        self.assertAlmostEqual(compute_grad_norm(self.params), max_norm, places=4)
+        for b, p in zip(before, self.params):  # direction kept
+            self.assertTrue(torch.allclose(p.grad, b * (max_norm / self.norm), rtol=1e-4))
+
+    def test_skips_params_without_grad(self):
+        extra = nn.Parameter(torch.zeros(3))  # grad is None
+        self.assertTrue(clip_gradients(self.params + [extra], self.norm / 2, self.norm))
+        self.assertIsNone(extra.grad)
+
+    def test_clip_happens_before_the_step(self):
+        """SGD(lr=1): the parameter update is exactly -grad, so its norm is the clipped norm."""
+        torch.manual_seed(0)
+        online = nn.Sequential(nn.Linear(4, 6), nn.Tanh(), nn.Linear(6, 4))
+        target = nn.Sequential(nn.Linear(4, 6), nn.Tanh(), nn.Linear(6, 4))
+        opt = torch.optim.SGD(online.parameters(), lr=1.0)
+        before = [p.detach().clone() for p in online.parameters()]
+        max_norm = 1e-3
+        grads_finite, _, gnorm = _apply_guarded_step(online, target, opt, _ema_schedule(), max_norm=max_norm)
+        self.assertTrue(grads_finite)
+        self.assertGreater(gnorm, max_norm)  # logged norm is the pre-clip one
+        delta = torch.cat([(p.detach() - b).flatten() for b, p in zip(before, online.parameters())])
+        self.assertAlmostEqual(float(delta.norm()), max_norm, places=6)
+
+    def test_nonfinite_step_is_still_skipped(self):
+        torch.manual_seed(0)
+        online = nn.Sequential(nn.Linear(4, 6), nn.Tanh(), nn.Linear(6, 4))
+        target = nn.Sequential(nn.Linear(4, 6), nn.Tanh(), nn.Linear(6, 4))
+        opt = torch.optim.SGD(online.parameters(), lr=1.0)
+        before = [p.detach().clone() for p in online.parameters()]
+        grads_finite, step_applied, _ = _apply_guarded_step(
+            online, target, opt, _ema_schedule(), poison="0.weight", max_norm=1.0
+        )
+        self.assertFalse(grads_finite or step_applied)
+        for b, p in zip(before, online.parameters()):
+            self.assertTrue(torch.equal(b, p))
+
+
+class CheckOptimizationConfigTest(unittest.TestCase):
+    def test_defaults(self):
+        self.assertEqual(check_optimization_config(None, (0.9, 0.999)), (None, (0.9, 0.999)))
+
+    def test_normalises_yaml_values(self):
+        self.assertEqual(check_optimization_config(1, [0.9, 0.95]), (1.0, (0.9, 0.95)))
+
+    def test_rejects_bad_values(self):
+        bad = ((0, (0.9, 0.95)), (-1.0, (0.9, 0.95)), (None, (0.9,)), (None, (0.9, 1.0)), (None, (-0.1, 0.9)))
+        for clip, betas in bad:
+            with self.subTest(clip=clip, betas=betas), self.assertRaises(ValueError):
+                check_optimization_config(clip, betas)
+
+
+class ApplyOptimizerHparamsTest(unittest.TestCase):
+    def test_config_wins_over_resumed_state(self):
+        mod = nn.Linear(4, 4)
+        old = torch.optim.AdamW(
+            [{"params": [mod.weight]}, {"params": [mod.bias], "weight_decay": 0}], betas=(0.9, 0.999), eps=1e-8
+        )
+        new = torch.optim.AdamW(
+            [{"params": [mod.weight]}, {"params": [mod.bias], "weight_decay": 0}], betas=(0.9, 0.95), eps=1e-6
+        )
+        new.load_state_dict(old.state_dict())
+        self.assertEqual(new.param_groups[0]["betas"], (0.9, 0.999))  # the trap this guards against
+
+        apply_optimizer_hparams(new, (0.9, 0.95), 1e-6)
+        for g in new.param_groups:
+            self.assertEqual(g["betas"], (0.9, 0.95))
+            self.assertEqual(g["eps"], 1e-6)
+
+        (mod(torch.randn(3, 4)) ** 2).mean().backward()
+        new.step()  # still a working optimizer
+
+
+class QKTemperatureSummaryTest(unittest.TestCase):
+    def test_none_without_temperatures(self):
+        self.assertIsNone(qk_temperature_summary(Attention(16, num_heads=2, qk_norm="rms")))
+
+    def test_reports_max_and_heads_at_cap(self):
+        class Blocks(nn.Module):
+            def __init__(self):
+                super().__init__()
+                kw = dict(num_heads=2, qk_norm="rms", qk_norm_affine=False, qk_temperature_max=4.0)
+                self.blocks = nn.ModuleList([Attention(16, **kw) for _ in range(2)])
+
+        m = Blocks()
+        with torch.no_grad():
+            m.blocks[1].qk_temperature.log_temperature.copy_(torch.tensor([10.0, 0.0]))
+        self.assertEqual(qk_temperature_summary(m), "0:1.00/0 1:4.00/1")
 
 
 if __name__ == "__main__":

@@ -14,26 +14,33 @@ except Exception:
 
 import copy
 import gc
+import logging
 import random
+import re
 import time
 
 import numpy as np
 import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
+from app.vjepa_2_1.compile_fixes import compile_models
 from app.vjepa_2_1.models.utils.masks_dist import compute_mask_distance
-from app.vjepa_2_1.models.utils.modules import Lambda_LinearWarmupHold
+from app.vjepa_2_1.models.utils.modules import Lambda_LinearWarmupHold, QKTemperature
 from app.vjepa_2_1.transforms import make_transforms
 from app.vjepa_2_1.utils import (
+    apply_optimizer_hparams,
     init_opt,
     init_video_model,
     load_checkpoint,
     normalize_nested,
 )
+from kneeno.config import expand_env_vars
+from kneeno.evaluation import ClassificationEvaluator, tasks_due
 from src.datasets.data_manager import init_data
+from src.datasets.kneeno_adapter import VJepa21Adapter
+from src.datasets.mi_dataset import check_series_depth
 from src.masks.multiseq_multiblock3d import MaskCollator
 from src.masks.utils import apply_masks
-from src.utils.config import expand_env_vars
 from src.utils.distributed import init_distributed
 from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
 from torch.nn.parallel import DistributedDataParallel
@@ -63,6 +70,48 @@ def compute_grad_norm(parameters, norm_type=2.0):
     )
     return float(total)
 
+
+def clip_gradients(parameters, max_norm, total_norm):
+    """Rescale the gradients in place so their global L2 norm is at most ``max_norm``.
+
+    ``total_norm`` is the norm already computed by ``compute_grad_norm`` (must be finite), so
+    the gradients are not traversed twice. No-op when ``max_norm`` is ``None`` (clipping
+    disabled) or the norm is already within bounds. Returns whether the gradients were clipped.
+    """
+    if max_norm is None or total_norm <= max_norm:
+        return False
+    grads = [p for p in parameters if p.grad is not None]
+    torch.nn.utils.clip_grads_with_norm_(grads, max_norm, torch.tensor(total_norm))
+    return True
+
+
+def check_optimization_config(gradient_clipping, betas):
+    """Validate ``optimization.gradient_clipping`` / ``optimization.betas``; returns them normalised."""
+    if gradient_clipping is not None:
+        gradient_clipping = float(gradient_clipping)
+        if not gradient_clipping > 0:
+            raise ValueError(f"optimization.gradient_clipping must be null or > 0, got {gradient_clipping}")
+    betas = tuple(float(b) for b in betas)
+    if len(betas) != 2 or not all(0.0 <= b < 1.0 for b in betas):
+        raise ValueError(f"optimization.betas must be two values in [0, 1), got {betas}")
+    return gradient_clipping, betas
+
+
+def qk_temperature_summary(model):
+    """``"<block>:<max temperature>/<heads at the cap>"`` per ``QKTemperature`` in ``model``.
+
+    Returns ``None`` when the model has no QK temperatures (``model.qk_temperature_max: null``).
+    """
+    rows = []
+    for name, mod in model.named_modules():
+        if isinstance(mod, QKTemperature):
+            block = re.search(r"blocks\.(\d+)\.", name)
+            max_t = float(mod.temperature().detach().max())
+            at_cap = int((mod.log_temperature.detach() >= mod.log_max).sum())
+            rows.append(f"{block.group(1) if block else name}:{max_t:.2f}/{at_cap}")
+    return " ".join(rows) if rows else None
+
+
 _GLOBAL_SEED = 0
 random.seed(_GLOBAL_SEED)
 np.random.seed(_GLOBAL_SEED)
@@ -71,6 +120,9 @@ torch.backends.cudnn.benchmark = True
 
 
 logger = get_logger(__name__, force=True)
+
+NORMALIZE_RGB = ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+NORMALIZE_MI = ((0.5,), (0.5,))
 
 
 def main(args, resume_preempt=False):
@@ -116,7 +168,8 @@ def main(args, resume_preempt=False):
     # -- MODEL
     cfgs_model = args.get("model")
     compile_model = cfgs_model.get("compile_model", False)
-    use_activation_checkpointing = cfgs_model.get("use_activation_checkpointing", False)
+    use_activation_checkpointing = cfgs_model.get("use_activation_checkpointing", True)
+    activation_memory_budget = cfgs_model.get("activation_memory_budget", 0.5)
     model_name = cfgs_model.get("model_name")
     pred_depth = cfgs_model.get("pred_depth")
     pred_num_heads = cfgs_model.get("pred_num_heads", None)
@@ -141,7 +194,11 @@ def main(args, resume_preempt=False):
     lambda_progressive = cfgs_model.get("lambda_progressive", True)
     lambda_warmup_start_iter = cfgs_model.get("lambda_warmup_start_iter", 15000)
     lambda_warmup_end_iter = cfgs_model.get("lambda_warmup_end_iter", 30000)
-    qk_norm = cfgs_model.get("qk_norm", "none")
+    qk_norm = cfgs_model.get("qk_norm", "rms")
+    # defaults = the bounded-QK recipe (as in eval_classification.py); a config without a q/k norm must set
+    # qk_temperature_max: null, the old behaviour is qk_norm_affine: true + qk_temperature_max: null
+    qk_norm_affine = cfgs_model.get("qk_norm_affine", False)
+    qk_temperature_max = cfgs_model.get("qk_temperature_max", 4.0)
     normalize_predictor = cfgs_model.get("normalize_predictor", False)
     modality_embedding = cfgs_model.get("modality_embedding", False)
     levels_predictor = cfgs_model.get("levels_predictor", 4)
@@ -156,7 +213,8 @@ def main(args, resume_preempt=False):
     elif model_name == "vit_gigantic_xformers":
         embed_dim_encoder = 1664
     else:
-        print("Model name not recognized :(")
+        raise ValueError("Model name not recognized :(")
+
 
     # -- DATA
     cfgs_data = args.get("data")
@@ -168,18 +226,13 @@ def main(args, resume_preempt=False):
     # -- MI (medical imaging) dataset: folders of JPEG slices loaded as 3D volumes
     mi_data_root = cfgs_data.get("data_root")
     mi_data_meta = cfgs_data.get("data_meta")
-    # series_depth <= 0 -> keep every slice (depth-bucketing sampler);
-    # series_depth > 0 -> resample each volume to this many slices
-    series_depth = cfgs_data.get("series_depth", 0)
-    # depth-resampling method when series_depth > 0: "nearest" or "interpolate"
+    # every volume is resampled to this many slices (required, > 0, for MI data)
+    series_depth = cfgs_data.get("series_depth")
+    # depth-resampling method: "nearest" or "interpolate"
     resample_mode = cfgs_data.get("resample_mode", "nearest")
     if is_mi_dataset:
-        if series_depth and series_depth > 0:
-            dataset_fpcs = [series_depth]
-        else:
-            from src.datasets.mi_dataset import get_series_depths
-
-            dataset_fpcs = get_series_depths(mi_data_meta)
+        check_series_depth(series_depth)
+        dataset_fpcs = [series_depth]
     else:
         dataset_fpcs = cfgs_data.get("dataset_fpcs")
     max_num_frames = max(dataset_fpcs)
@@ -210,6 +263,7 @@ def main(args, resume_preempt=False):
 
     # -- DATA AUGS
     cfgs_data_aug = args.get("data_aug")
+    random_horizontal_flip = cfgs_data_aug.get("random_horizontal_flip", True)
     ar_range = cfgs_data_aug.get("random_resize_aspect_ratio", [3 / 4, 4 / 3])
     rr_scale = cfgs_data_aug.get("random_resize_scale", [0.3, 1.0])
     motion_shift = cfgs_data_aug.get("motion_shift", False)
@@ -245,12 +299,23 @@ def main(args, resume_preempt=False):
     ema = cfgs_opt.get("ema")
     use_radamw = cfgs_opt.get("use_radamw", False)
     betas = cfgs_opt.get("betas", (0.9, 0.999))
-    eps = cfgs_opt.get("eps", 1.0e-8)
+    eps = float(cfgs_opt.get("eps", 1.0e-8))
+    # max global L2 norm of the encoder + predictor gradients; None disables clipping
+    gradient_clipping = cfgs_opt.get("gradient_clipping", None)
+    gradient_clipping, betas = check_optimization_config(gradient_clipping, betas)
     loss_reg_std_mult = cfgs_opt.get("loss_reg_std_mult", None)
     loss_reg_num_tracking_steps = cfgs_opt.get("loss_reg_num_tracking_steps", 300)
     loss_reg_min_epoch = cfgs_opt.get("loss_reg_min_epoch", 50)
     if loss_reg_std_mult is not None:
         logger.info("Loss regulation activated")
+
+    # -- EVAL (KneeNo classification evaluation, run periodically during pretraining)
+    # Absent "eval:" block -> evaluation is skipped entirely.
+    cfgs_eval = args.get("eval")
+    if cfgs_eval is not None:
+        # VJepa21Adapter keeps the volume depth, so the labeled volumes must be resampled too;
+        # checked here rather than failing at the first evaluation batch
+        check_series_depth(cfgs_eval.get("data", {}).get("series_depth"), "eval.data.series_depth")
     # ----------------------------------------------------------------------- #
 
     np.random.seed(seed)
@@ -263,6 +328,12 @@ def main(args, resume_preempt=False):
 
     # -- init torch distributed backend
     world_size, rank = init_distributed()
+    # app/main.py silences ranks != 0, but the module-level get_logger(force=True) above
+    # resets the root logger to INFO when this module is imported -> re-apply per rank.
+    # captureWarnings routes warnings.warn through logging so they are filtered too.
+    logging.captureWarnings(True)
+    if rank != 0:
+        logging.getLogger().setLevel(logging.ERROR)
     data_world_size, data_rank = world_size, rank
     logger.info(f"Initialized (rank/world-size) {rank}/{world_size}")
     img_world_size = 0
@@ -376,6 +447,7 @@ def main(args, resume_preempt=False):
         ("%.5f", "loss"),
         ("%.5f", "loss-pred"),
         ("%.5f", "loss-context"),
+        ("%.4e", "grad-norm"),
         ("%d", "iter-time(ms)"),
         ("%d", "gpu-time(ms)"),
         ("%d", "dataload-time(ms)"),
@@ -415,15 +487,19 @@ def main(args, resume_preempt=False):
         interpolate_rope=interpolate_rope,
         modality_embedding=modality_embedding,
         qk_norm=qk_norm,
+        qk_norm_affine=qk_norm_affine,
+        qk_temperature_max=qk_temperature_max,
     )
     target_encoder = copy.deepcopy(encoder)
 
     if compile_model:
         logger.info("Compiling encoder, target_encoder, and predictor.")
-        torch._dynamo.config.optimize_ddp = False
-        encoder.compile()
-        target_encoder.compile()
-        predictor.compile()
+        compile_models(
+            encoder,
+            target_encoder,
+            predictor,
+            activation_memory_budget=None if use_activation_checkpointing else activation_memory_budget,
+        )
 
     mask_collator = MaskCollator(
         cfgs_mask=cfgs_mask,
@@ -435,11 +511,11 @@ def main(args, resume_preempt=False):
 
     if is_mi_dataset:
         # single-channel grayscale volumes -> single-value normalize (~maps [0, 255] to [-1, 1])
-        normalize = ((0.5,), (0.5,))
+        normalize = NORMALIZE_MI
     else:
-        normalize = ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+        normalize = NORMALIZE_RGB
     transform = make_transforms(
-        random_horizontal_flip=True,
+        random_horizontal_flip=random_horizontal_flip,
         random_resize_aspect_ratio=ar_range,
         random_resize_scale=rr_scale,
         reprob=reprob,
@@ -482,6 +558,7 @@ def main(args, resume_preempt=False):
     if ipe is None:
         ipe = _dlen
     logger.info(f"Using batch size of {batch_size}, fpcs of {dataset_fpcs}")
+    logger.info(f"AdamW betas={betas} eps={eps}, gradient_clipping={gradient_clipping}")
     logger.info(f"iterations per epoch/dataset length: {ipe}/{_dlen}")
 
     # zizi
@@ -530,7 +607,7 @@ def main(args, resume_preempt=False):
 
     start_epoch = 0
     # -- load training checkpoint
-    print("Loadind checkpoint from: ", load_path)
+    print("Loading checkpoint from: ", load_path)
     if load_model or os.path.exists(latest_path):
         (
             encoder,
@@ -548,6 +625,8 @@ def main(args, resume_preempt=False):
             scaler=scaler,
             is_anneal=is_anneal and not resume_anneal,
         )
+        # opt.load_state_dict restored the checkpoint's betas/eps; the config wins
+        apply_optimizer_hparams(optimizer, betas, eps)
         if not is_anneal or resume_anneal:
             for _ in range(start_epoch * ipe):
                 scheduler.step()
@@ -574,6 +653,22 @@ def main(args, resume_preempt=False):
             torch.save(save_dict, path)
         except Exception as e:
             logger.info(f"Encountered exception when saving checkpoint: {e}")
+
+    # KneeNo classification evaluation (frozen encoder, run every eval.freq.<task> epochs)
+    evaluator = None
+    if cfgs_eval is not None:
+        eval_adapter = VJepa21Adapter(
+            embed_dim=embed_dim_encoder,
+            crop_size=crop_size,
+            normalize=normalize,
+        )
+        evaluator = ClassificationEvaluator(
+            config=cfgs_eval,
+            adapter=eval_adapter,
+            device=device,
+            rank=rank,
+            world_size=world_size,
+        )
 
     logger.info("Initializing loader...")
     unsupervised_sampler.set_epoch(start_epoch)
@@ -605,6 +700,7 @@ def main(args, resume_preempt=False):
 
         loss_meter = AverageMeter()
         epoch_skips = 0
+        epoch_clipped = 0
         mask_meters = {fpc: AverageMeter() for fpc in dataset_fpcs}
         iter_time_meter = AverageMeter()
         gpu_time_meter = AverageMeter()
@@ -755,7 +851,7 @@ def main(args, resume_preempt=False):
 
                 # Step 1. Forward
                 loss_context = None
-                with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
+                with torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=mixed_precision):
                     h = forward_target(clips)
                     z_pred, z_context = forward_context(clips)
                     loss = 0
@@ -805,6 +901,8 @@ def main(args, resume_preempt=False):
                         )
 
                 grads_finite = True
+                clipped = False
+                grad_norm = float("nan")  # stays nan when the loss regulariser skipped the step
                 if run_step:
                     if scaler is not None:
                         scaler.scale(loss).backward()
@@ -818,6 +916,9 @@ def main(args, resume_preempt=False):
                     grads_finite = bool(np.isfinite(grad_norm))
 
                     if grads_finite:
+                        # after unscale_ (true grads) and the DDP all-reduce (identical on every
+                        # rank); the logged grad_norm stays the pre-clip norm
+                        clipped = clip_gradients(enc_params + pred_params, gradient_clipping, grad_norm)
                         if scaler is not None:
                             scaler.step(optimizer)
                             scaler.update()
@@ -850,6 +951,8 @@ def main(args, resume_preempt=False):
                     "loss_pred": loss_pred_v,
                     "loss_context": loss_context_v,
                     "grads_finite": grads_finite,
+                    "grad_norm": grad_norm,
+                    "clipped": clipped,
                 }
 
             step_out, gpu_etime_ms = gpu_timer(train_step)
@@ -861,6 +964,7 @@ def main(args, resume_preempt=False):
             iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
             loss_meter.update(loss)
 
+            epoch_clipped += int(step_out["clipped"])
             if step_out["grads_finite"]:
                 consecutive_nonfinite = 0
             else:
@@ -903,6 +1007,7 @@ def main(args, resume_preempt=False):
                     loss,
                     step_out["loss_pred"],
                     step_out["loss_context"],
+                    step_out["grad_norm"],
                     iter_elapsed_time_ms,
                     gpu_etime_ms,
                     data_elapsed_time_ms,
@@ -918,6 +1023,7 @@ def main(args, resume_preempt=False):
                         "[pred: %.3f ctx: %.3f] "
                         "masks: %s "
                         "[wd: %.2e] [lr: %.2e] "
+                        "[grad: %.2e] "
                         "[mem: %.2e] "
                         "[iter: %.1f ms] "
                         "[gpu: %.1f ms] "
@@ -940,6 +1046,7 @@ def main(args, resume_preempt=False):
                             + "]",
                             _new_wd,
                             _new_lr,
+                            step_out["grad_norm"],
                             torch.cuda.max_memory_allocated() / 1024.0**2,
                             iter_time_meter.avg,
                             gpu_time_meter.avg,
@@ -953,15 +1060,36 @@ def main(args, resume_preempt=False):
         # -- Save Checkpoint
         logger.info("avg. loss %.3f" % loss_meter.avg)
         logger.info(
-            "[epoch %d summary] guard-skipped=%d"
+            "[epoch %d summary] guard-skipped=%d clipped=%d"
             % (
                 epoch + 1,
                 epoch_skips,
+                epoch_clipped,
             )
         )
+        qk_temps = qk_temperature_summary(encoder)
+        if qk_temps is not None:
+            # block:max-temperature/heads-at-cap, cap = model.qk_temperature_max
+            logger.info("[epoch %d qk-temperature] %s" % (epoch + 1, qk_temps))
         if (epoch + 1) % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1):
             save_checkpoint(epoch + 1, latest_path)
             if save_every_freq > 0 and (epoch + 1) % save_every_freq == 0:
                 save_every_file = f"e{epoch}.pth.tar"
                 save_every_path = os.path.join(folder, save_every_file)
                 save_checkpoint(epoch + 1, save_every_path)
+
+        # KneeNo classification evaluation (frozen encoder). Each task logs one
+        # TensorBoard point per embedding-model epoch, its test metrics, so e.g.
+        # the knn and linear_pool curves stay aligned even though knn has no
+        # head-training epochs and linear_pool has several. Called on every
+        # rank, but ClassificationEvaluator itself only does work on rank 0 and
+        # broadcasts the result -> safe under DDP.
+        if evaluator is not None:
+            due_tasks = tasks_due(epoch, evaluator.config["freq"])
+            if due_tasks:
+                eval_encoder = target_encoder if evaluator.config.get("encoder", "target") == "target" else encoder
+                eval_metrics = evaluator.evaluate(eval_encoder, tasks=due_tasks, epoch=epoch)
+                logger.info(f"[epoch {epoch + 1}] eval ({due_tasks}): {eval_metrics}")
+
+    if evaluator is not None:
+        evaluator.cleanup()

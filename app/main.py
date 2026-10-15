@@ -3,16 +3,23 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
+
+# Expandable segments let freed memory be reused for any size. setdefault, so an explicit setting in the job
+# environment wins.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
 import multiprocessing as mp
 import pprint
 from pathlib import Path
 
 import yaml
+from kneeno.config import expand_env_vars
 
 from app.scaffold import main as app_main
-from src.utils.config import expand_env_vars
 from src.utils.distributed import init_distributed
+from src.utils.logging import git_information
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--fname", type=str, help="name of config file to load", default="configs.yaml")
@@ -57,15 +64,36 @@ def process_main(rank, fname, world_size, devices):
         params = expand_env_vars(params)
         logger.info("loaded params...")
 
+
+    def _get_safe_path(folder, original_file_name):
+        path = os.path.join(folder, original_file_name)
+        root, ext = os.path.splitext(path)
+
+        i = 0
+        while os.path.isfile(path):
+            i += 1
+            path = os.path.join(folder, f"{root}-{i}{ext}")
+
+        return path
+
     # Log config
     if rank == 0:
         pprint.PrettyPrinter(indent=4).pprint(params)
         folder = params["folder"]
-        params_path = os.path.join(folder, "params-pretrain.yaml")
         folder = Path(folder)
         folder.mkdir(parents=True, exist_ok=True)
+
+        params_path = _get_safe_path(folder, "params-pretrain.yaml")
+
         with open(params_path, "w") as f:
             yaml.dump(params, f)
+
+        # -------------- Save git info file --------------
+        git_info_fpath = _get_safe_path(folder, "git-info.txt")
+
+        with open(git_info_fpath, "w") as f:
+            f.write(git_information())
+        # ----------------------------------------------
 
     # Init distributed (access to comm between GPUS on same machine)
     world_size, rank = init_distributed(rank_and_world_size=(rank, world_size))

@@ -27,8 +27,22 @@ Coverage:
 - A ``qk_norm="layer"`` model loads a ``qk_norm="none"`` checkpoint (``strict=False``)
   with only the ``*_norm.*`` keys missing; the reverse only reports them as unexpected.
 - ``Lambda_LinearWarmupHold`` honours a custom ``start_iter``/``end_iter``.
+
+Bounded QK logits (``model.qk_norm_affine`` / ``model.qk_temperature_max``):
+- the defaults (``True`` / ``None``) build exactly today's model: same state_dict keys, same forward.
+- ``qk_norm_affine=False`` drops the norm's gain (and LayerNorm bias); ``_init_weights`` copes.
+- ``qk_temperature_max`` adds one ``log_temperature`` per head (init ``t = 1``, so the forward
+  equals the non-affine model without it), clamps it to the max, bounds every logit by
+  ``t_max * sqrt(head_dim)``, gets gradients, and is rejected in combinations that leave the
+  logits unbounded.
+- ``init_video_model`` wires both into the predictor too.
+- ``load_checkpoint`` refuses a checkpoint whose q/k-norm parameters don't match the model.
 """
 
+import os
+import tempfile
+
+import math
 import unittest
 
 import torch
@@ -38,9 +52,10 @@ import app.vjepa_2_1.models.vision_transformer as video_vit
 from app.vjepa_2_1.models.utils.modules import (
     Attention,
     Lambda_LinearWarmupHold,
+    QKTemperature,
     get_norm_layer,
 )
-from app.vjepa_2_1.utils import init_video_model
+from app.vjepa_2_1.utils import init_opt, init_video_model, load_checkpoint
 
 EMBED_DIM = 16
 NUM_HEADS = 2
@@ -232,6 +247,234 @@ class CheckpointCompatTest(unittest.TestCase):
         self.assertTrue(
             all(".q_norm." in k or ".k_norm." in k for k in msg.unexpected_keys)
         )
+
+
+T_MAX = 4.0
+
+
+def _plain_attn(**kw):
+    """The non-RoPE path, driven via ``Attention`` directly: a ``use_rope=False``
+    ``VisionTransformer`` has no ``pos_embed`` and cannot run a forward pass."""
+    torch.manual_seed(0)
+    return Attention(EMBED_DIM, num_heads=NUM_HEADS, **kw)
+
+
+class QKNormAffineDefaultTest(unittest.TestCase):
+    def test_defaults_build_todays_model(self):
+        for mode in ("none", "layer", "rms"):
+            with self.subTest(qk_norm=mode):
+                torch.manual_seed(0)
+                a = _make_vit(use_rope=True, qk_norm=mode)
+                torch.manual_seed(0)
+                b = _make_vit(use_rope=True, qk_norm=mode, qk_norm_affine=True, qk_temperature_max=None)
+                self.assertEqual(list(a.state_dict()), list(b.state_dict()))
+                self.assertIsInstance(b.blocks[0].attn.qk_temperature, nn.Identity)
+                a.eval()
+                b.eval()
+                x = _clip()
+                with torch.no_grad():
+                    self.assertTrue(torch.equal(a(x), b(x)))
+
+                pa = _plain_attn(qk_norm=mode)
+                pb = _plain_attn(qk_norm=mode, qk_norm_affine=True, qk_temperature_max=None)
+                self.assertEqual(list(pa.state_dict()), list(pb.state_dict()))
+                x = torch.randn(2, 7, EMBED_DIM)
+                with torch.no_grad():
+                    self.assertTrue(torch.equal(pa(x), pb(x)))
+
+
+class QKNormNonAffineTest(unittest.TestCase):
+    def test_no_norm_params_and_init_does_not_crash(self):
+        base = sum(p.numel() for p in _make_vit(use_rope=True, qk_norm="none").parameters())
+        for mode, cls in (("layer", nn.LayerNorm), ("rms", nn.RMSNorm)):
+            with self.subTest(qk_norm=mode):
+                m = _make_vit(use_rope=True, qk_norm=mode, qk_norm_affine=False)  # runs _init_weights
+                qn = m.blocks[0].attn.q_norm
+                self.assertIsInstance(qn, cls)
+                self.assertIsNone(qn.weight)
+                self.assertEqual(sum(p.numel() for p in m.parameters()), base)
+                self.assertTrue(torch.isfinite(m(_clip())).all())
+
+    def test_normalises_q_to_sqrt_head_dim(self):
+        for mode in ("layer", "rms"):
+            with self.subTest(qk_norm=mode):
+                attn = Attention(EMBED_DIM, num_heads=NUM_HEADS, qk_norm=mode, qk_norm_affine=False)
+                q = 100 * torch.randn(2, NUM_HEADS, 7, HEAD_DIM)
+                norms = attn.q_norm(q).norm(dim=-1)
+                self.assertTrue(torch.allclose(norms, torch.full_like(norms, math.sqrt(HEAD_DIM)), rtol=1e-3))
+
+
+class QKTemperatureTest(unittest.TestCase):
+    def _vit(self, mode="rms", use_rope=True, **kw):
+        return _make_vit(use_rope=use_rope, qk_norm=mode, qk_norm_affine=False, **kw)
+
+    def test_one_param_per_head_per_block(self):
+        base = sum(p.numel() for p in self._vit().parameters())
+        n = sum(p.numel() for p in self._vit(qk_temperature_max=T_MAX).parameters())
+        self.assertEqual(n - base, DEPTH * NUM_HEADS)
+        temp = self._vit(qk_temperature_max=T_MAX).blocks[0].attn.qk_temperature
+        self.assertIsInstance(temp, QKTemperature)
+        self.assertEqual(tuple(temp.log_temperature.shape), (NUM_HEADS,))
+
+    def test_init_is_identity(self):
+        """t = 1 at init, so the forward equals the non-affine model without a temperature."""
+        for mode in ("layer", "rms"):
+            with self.subTest(qk_norm=mode):
+                torch.manual_seed(0)
+                a = self._vit(mode)
+                torch.manual_seed(0)
+                b = self._vit(mode, qk_temperature_max=T_MAX)
+                self.assertTrue(torch.equal(b.blocks[0].attn.qk_temperature.temperature(), torch.ones(NUM_HEADS)))
+                b.load_state_dict(a.state_dict(), strict=False)
+                a.eval()
+                b.eval()
+                x = _clip()
+                with torch.no_grad():
+                    self.assertTrue(torch.allclose(a(x), b(x), atol=1e-6))
+
+                pa = _plain_attn(qk_norm=mode, qk_norm_affine=False)
+                pb = _plain_attn(qk_norm=mode, qk_norm_affine=False, qk_temperature_max=T_MAX)
+                x = torch.randn(2, 7, EMBED_DIM)
+                with torch.no_grad():
+                    self.assertTrue(torch.allclose(pa(x), pb(x), atol=1e-6))
+
+    def test_clamp_bounds_the_logits(self):
+        for mode in ("layer", "rms"):
+            with self.subTest(qk_norm=mode):
+                attn = Attention(
+                    EMBED_DIM, num_heads=NUM_HEADS, qk_norm=mode, qk_norm_affine=False, qk_temperature_max=T_MAX
+                )
+                with torch.no_grad():
+                    attn.qk_temperature.log_temperature.fill_(10.0)  # far above log(T_MAX)
+                self.assertTrue(torch.allclose(attn.qk_temperature.temperature(), torch.full((NUM_HEADS,), T_MAX)))
+
+                q = 100 * torch.randn(2, NUM_HEADS, 7, HEAD_DIM)
+                logits = attn.qk_temperature(attn.q_norm(q)) @ attn.k_norm(q).transpose(-2, -1) * attn.scale
+                cap = T_MAX * math.sqrt(HEAD_DIM)
+                self.assertLessEqual(float(logits.abs().max()), cap * (1 + 1e-4))
+                self.assertGreater(float(logits.abs().max()), 0.99 * cap)  # q . q hits the cap
+
+    def test_gets_gradients_below_cap_and_none_at_cap(self):
+        m = self._vit(qk_temperature_max=T_MAX)
+        m(_clip()).pow(2).mean().backward()
+        g = m.blocks[0].attn.qk_temperature.log_temperature.grad
+        self.assertTrue(torch.isfinite(g).all())
+        self.assertTrue((g != 0).any())
+
+        attn = Attention(EMBED_DIM, num_heads=NUM_HEADS, qk_norm="rms", qk_norm_affine=False, qk_temperature_max=T_MAX)
+        with torch.no_grad():
+            attn.qk_temperature.log_temperature.fill_(10.0)
+        attn(torch.randn(2, 7, EMBED_DIM)).pow(2).mean().backward()
+        self.assertTrue(torch.equal(attn.qk_temperature.log_temperature.grad, torch.zeros(NUM_HEADS)))
+
+    def test_in_no_weight_decay_group(self):
+        m = self._vit(qk_temperature_max=T_MAX)
+        optimizer, _, _, _ = init_opt(
+            is_anneal=False,
+            encoder=m,
+            predictor=nn.Linear(2, 2),
+            iterations_per_epoch=1,
+            start_lr=1e-4,
+            ref_lr=1e-4,
+            warmup=0,
+            num_epochs=1,
+        )
+        temps = {id(mod.log_temperature) for mod in m.modules() if isinstance(mod, QKTemperature)}
+        self.assertEqual(len(temps), DEPTH)
+        no_wd = {id(p) for g in optimizer.param_groups if g.get("WD_exclude") for p in g["params"]}
+        self.assertTrue(temps <= no_wd)
+
+    def test_rejects_unbounded_combinations(self):
+        bad = (
+            dict(qk_norm="none", qk_norm_affine=False, qk_temperature_max=T_MAX),
+            dict(qk_norm="rms", qk_norm_affine=True, qk_temperature_max=T_MAX),
+            dict(qk_norm="layer", qk_norm_affine=True, qk_temperature_max=T_MAX),
+            dict(qk_norm="rms", qk_norm_affine=False, qk_temperature_max=0.5),
+        )
+        for kw in bad:
+            for use_rope in (True, False):
+                with self.subTest(use_rope=use_rope, **kw):
+                    with self.assertRaises(ValueError):
+                        _make_vit(use_rope=use_rope, **kw)
+
+
+class InitVideoModelQKTemperatureTest(unittest.TestCase):
+    def test_encoder_and_predictor_get_both_options(self):
+        torch.manual_seed(0)
+        enc, pred = init_video_model(
+            device=torch.device("cpu"),
+            patch_size=PATCH_SIZE,
+            max_num_frames=NUM_FRAMES,
+            tubelet_size=TUBELET_SIZE,
+            in_chans=1,
+            model_name="vit_tiny",
+            crop_size=CROP_SIZE,
+            pred_depth=DEPTH,
+            pred_embed_dim=24,
+            use_rope=True,
+            modality_embedding=True,
+            qk_norm="rms",
+            qk_norm_affine=False,
+            qk_temperature_max=T_MAX,
+        )
+        for attn in (enc.backbone.blocks[0].attn, pred.backbone.predictor_blocks[0].attn):
+            self.assertIsNone(attn.q_norm.weight)
+            self.assertIsInstance(attn.qk_temperature, QKTemperature)
+            self.assertEqual(attn.qk_temperature.log_temperature.numel(), attn.num_heads)
+
+        out = enc([_clip()])
+        sum(o.pow(2).mean() for o in out).backward()
+        g = enc.backbone.blocks[0].attn.qk_temperature.log_temperature.grad
+        self.assertIsNotNone(g)
+        self.assertTrue(torch.isfinite(g).all())
+
+
+class LoadCheckpointQKGuardTest(unittest.TestCase):
+    """``load_checkpoint`` loads ``strict=False``, but must not silently drop q/k-norm params."""
+
+    def _save(self, encoder, path):
+        predictor = nn.Linear(2, 2)
+        opt = torch.optim.AdamW(list(encoder.parameters()) + list(predictor.parameters()))
+        torch.save(
+            {
+                "epoch": 3,
+                "encoder": encoder.state_dict(),
+                "predictor": predictor.state_dict(),
+                "target_encoder": encoder.state_dict(),
+                "opt": opt.state_dict(),
+                "scaler": None,
+            },
+            path,
+        )
+
+    def _load(self, path, encoder):
+        predictor = nn.Linear(2, 2)
+        opt = torch.optim.AdamW(list(encoder.parameters()) + list(predictor.parameters()))
+        return load_checkpoint(path, encoder, predictor, encoder, opt, None)
+
+    def test_matching_architecture_loads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "latest.pth.tar")
+            kw = dict(qk_norm="rms", qk_norm_affine=False, qk_temperature_max=T_MAX)
+            src = _make_vit(use_rope=True, **kw)
+            with torch.no_grad():
+                src.blocks[0].attn.qk_temperature.log_temperature.fill_(0.5)
+            self._save(src, path)
+            dst = _make_vit(use_rope=True, **kw)
+            *_, epoch = self._load(path, dst)
+            self.assertEqual(epoch, 3)
+            log_t = dst.blocks[0].attn.qk_temperature.log_temperature
+            self.assertTrue(torch.equal(log_t, torch.full((NUM_HEADS,), 0.5)))
+
+    def test_mismatched_qk_norm_raises(self):
+        affine = dict(qk_norm="rms")
+        bounded = dict(qk_norm="rms", qk_norm_affine=False, qk_temperature_max=T_MAX)
+        for src_kw, dst_kw in ((affine, bounded), (bounded, affine), (dict(qk_norm="none"), affine)):
+            with self.subTest(src=src_kw, dst=dst_kw), tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "latest.pth.tar")
+                self._save(_make_vit(use_rope=True, **src_kw), path)
+                with self.assertRaisesRegex(ValueError, "q/k norm"):
+                    self._load(path, _make_vit(use_rope=True, **dst_kw))
 
 
 class LambdaWarmupWindowTest(unittest.TestCase):

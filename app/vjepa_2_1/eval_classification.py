@@ -1,0 +1,213 @@
+#!/usr/bin/env python
+# Copyright (c) Facebook, Inc. and its affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""Standalone post-pretraining KneeNo classification evaluation.
+
+Loads a frozen encoder from a V-JEPA 2.1 pretraining checkpoint (as written by
+``app/vjepa_2_1/train.py::save_checkpoint``) and hands it to
+``kneeno.evaluation.ClassificationEvaluator``, which trains every head on the train split with
+early stopping on val and logs one point per task and test set (``eval.data.test_sets``): its test
+metrics (the same protocol as the in-training hook in ``train.py``, which tests on ``internal`` only).
+With ``eval.verbose`` the per-head-epoch val metrics show the progress in the log.
+
+Usage::
+
+    .venv/bin/python -m app.vjepa_2_1.eval_classification \\
+        --fname configs/eval_2_1/vitb-384/medical_imaging.yaml \\
+        --checkpoint /path/to/latest.pth.tar \\
+        --tasks knn linear_pool attentive_pool
+
+Use a standalone eval config like that one, not a pretraining config: those set
+``eval.data.abort_on_io_error: false``, which replaces an exam that fails to load with a random one
+(a val exam may become a train exam), and test on ``internal`` only.
+
+The official (RGB-pretrained) V-JEPA 2.1 checkpoints load the same way, as a baseline: set
+``model.n_channels: 3`` (the grayscale volumes are repeated to a gray RGB video and normalized with
+``NORMALIZE_RGB``) and the checkpoint's architecture, e.g. ``qk_norm: none`` for
+``vjepa2_1_vitb_dist_vitG_384.pt``; ``--encoder target`` picks its ``ema_encoder``.
+"""
+
+import os
+
+# Expandable segments let freed memory be reused for any size. setdefault, so an explicit setting in the job
+# environment wins.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import argparse
+import pprint
+from pathlib import Path
+
+import torch
+import yaml
+from app.vjepa_2_1.utils import init_video_model
+from app.vjepa_2_1.train import NORMALIZE_MI, NORMALIZE_RGB
+from kneeno.config import expand_env_vars
+from kneeno.evaluation import ClassificationEvaluator
+from src.datasets.kneeno_adapter import VJepa21Adapter
+from src.datasets.mi_dataset import check_series_depth
+from src.utils.checkpoint_loader import robust_checkpoint_loader
+from src.utils.logging import get_logger
+
+logger = get_logger(__name__, force=True)
+
+# maps yaml eval.encoder / --encoder argument -> candidate keys in the checkpoint dict, first present one wins:
+# save_checkpoint() writes "target_encoder", the official V-JEPA 2.1 checkpoints call the EMA encoder "ema_encoder"
+ENCODER_STATE_DICT_KEYS = {"target": ("target_encoder", "ema_encoder"), "online": ("encoder",)}
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--fname", type=str, required=True, help="pretraining config (model + data + eval blocks)")
+    parser.add_argument("--checkpoint", type=str, required=True, help="path to a .pth.tar checkpoint")
+    parser.add_argument(
+        "--encoder",
+        type=str,
+        choices=list(ENCODER_STATE_DICT_KEYS),
+        default=None,
+        help="which encoder to evaluate; defaults to the config's eval.encoder (else 'target', i.e. the EMA encoder)",
+    )
+    parser.add_argument(
+        "--tasks",
+        type=str,
+        nargs="+",
+        default=None,
+        choices=["knn", "linear_pool", "attentive_pool"],
+        help="subset of tasks to run; defaults to every task V-JEPA 2.1 supports (knn, linear_pool, "
+        "attentive_pool; 'linear' needs a cls token, use linear_pool instead)",
+    )
+    parser.add_argument("--device", type=str, default="cpu", help="e.g. 'cpu' or 'cuda:0'")
+    return parser.parse_args()
+
+
+def build_encoder(cfgs_data, cfgs_model, in_chans, max_num_frames, device):
+    """Rebuild an encoder with the exact architecture the checkpoint was trained
+    with (parameter shapes/keys must match), mirroring the init_video_model
+    call in app/vjepa_2_1/train.py. The predictor this also returns is unused
+    and discarded -- init_video_model always builds both."""
+    encoder, _ = init_video_model(
+        device=device,
+        patch_size=cfgs_data["patch_size"],
+        max_num_frames=max_num_frames,
+        tubelet_size=cfgs_data["tubelet_size"],
+        in_chans=in_chans,
+        model_name=cfgs_model["model_name"],
+        crop_size=cfgs_data.get("crop_size", 224),
+        pred_depth=cfgs_model.get("pred_depth", 12),
+        pred_embed_dim=cfgs_model.get("pred_embed_dim", 384),
+        uniform_power=cfgs_model.get("uniform_power", False),
+        is_causal=cfgs_model.get("is_causal", False),
+        use_sdpa=True,
+        use_silu=cfgs_model.get("use_silu", False),
+        wide_silu=cfgs_model.get("wide_silu", True),
+        use_rope=cfgs_model.get("use_rope", False),
+        init_type=cfgs_model.get("init_type", "default"),
+        img_temporal_dim_size=cfgs_model.get("img_temporal_dim_size", None),
+        n_registers=cfgs_model.get("n_registers", 0),
+        has_cls_first=cfgs_model.get("has_cls_first", False),
+        interpolate_rope=cfgs_model.get("interpolate_rope", False),
+        modality_embedding=cfgs_model.get("modality_embedding", False),
+        qk_norm=cfgs_model.get("qk_norm", "rms"),
+        qk_norm_affine=cfgs_model.get("qk_norm_affine", False),
+        qk_temperature_max=cfgs_model.get("qk_temperature_max", 4.0),
+    )
+    return encoder
+
+
+def load_frozen_encoder(checkpoint_path, encoder, state_dict_keys):
+    """Load one encoder's weights from a pretraining checkpoint, freeze it.
+
+    ``state_dict_keys``: the checkpoint key holding the encoder's weights, or a sequence of
+    candidate keys of which the first present one is used (see ``ENCODER_STATE_DICT_KEYS``).
+
+    ``train.py`` saves the DDP-wrapped encoders, so the checkpoint's keys carry a ``module.``
+    prefix the bare ``MultiSeqWrapper`` built here does not have; it is stripped. Loading is
+    strict: a missing, unexpected or differently shaped parameter means the rebuilt
+    architecture does not match the checkpoint (e.g. a ``model:`` key not forwarded to
+    ``init_video_model``), and a partially loaded encoder would silently be evaluated with
+    (partly) random weights.
+    """
+    checkpoint = robust_checkpoint_loader(checkpoint_path, map_location=torch.device("cpu"))
+    if isinstance(state_dict_keys, str):
+        state_dict_keys = (state_dict_keys,)
+    state_dict_key = next((k for k in state_dict_keys if k in checkpoint), None)
+    if state_dict_key is None:
+        raise KeyError(f"checkpoint has none of {state_dict_keys}, only {list(checkpoint)}")
+    pretrained_dict = {k.removeprefix("module."): v for k, v in checkpoint[state_dict_key].items()}
+    encoder.load_state_dict(pretrained_dict, strict=True)
+    logger.info(f"loaded pretrained {state_dict_key!r} from epoch {checkpoint.get('epoch')}")
+
+    for p in encoder.parameters():
+        p.requires_grad = False
+    encoder.eval()
+    return encoder
+
+
+def main():
+    args = parse_args()
+    with open(args.fname, "r") as f:
+        config = expand_env_vars(yaml.load(f, Loader=yaml.FullLoader))
+    logger.info("loaded config:\n%s", pprint.pformat(config))
+
+    cfgs_eval = config.get("eval")
+    if cfgs_eval is None:
+        raise ValueError(f"{args.fname} has no 'eval:' block")
+
+    # Abort if evaluation results already exist
+    label_dir = cfgs_eval.get("logging").get("per_label_dir")
+    tb_dir = cfgs_eval.get("logging").get("tensorboard_dir")
+
+    if (label_dir is not None and Path(label_dir).exists() or
+        tb_dir is not None and Path(tb_dir).exists()):
+        raise ValueError(f"Evaluation results already exist on the given path (eval.logging.tensorboard_dir or eval.logging.per_label_dir).")
+
+    if label_dir is not None:
+        label_dir_path = Path(label_dir)
+        label_dir_path.mkdir(parents=True, exist_ok=True)
+
+        with open(label_dir_path.parent / "params.yaml", "w") as f:
+            yaml.dump(config, f)
+
+    else:
+        logger.warning("per_label_dir not specified in evaluation config. Skipping saving evaluation params to disk.")
+
+    cfgs_model = config["model"]
+    cfgs_data = config["data"]
+    in_chans = cfgs_model.get("n_channels", 1)
+
+    # the encoder is sized for the pretraining depth; the labeled volumes are resampled as well,
+    # since VJepa21Adapter keeps whatever depth it is given
+    max_num_frames = cfgs_eval.get("data", {}).get("series_depth")
+    check_series_depth(max_num_frames, "eval.data.series_depth")
+
+    device = torch.device(args.device)
+
+    encoder = build_encoder(cfgs_data, cfgs_model, in_chans, max_num_frames, device)
+    encoder_choice = args.encoder or cfgs_eval.get("encoder", "target")
+    encoder = load_frozen_encoder(args.checkpoint, encoder, ENCODER_STATE_DICT_KEYS[encoder_choice])
+    encoder.to(device)
+
+    adapter = VJepa21Adapter(
+        embed_dim=encoder.embed_dim,
+        n_channels=in_chans,
+        crop_size=cfgs_data.get("crop_size", 224),
+        normalize=NORMALIZE_MI if in_chans == 1 else NORMALIZE_RGB,
+    )
+
+    evaluator = ClassificationEvaluator(config=cfgs_eval, adapter=adapter, device=device)
+    try:
+        metrics = evaluator.evaluate(encoder, tasks=args.tasks, epoch=0)
+    finally:
+        # Flush+close the TensorBoard writer so buffered scalars are not lost
+        # if the process exits right after
+        evaluator.cleanup()
+
+    logger.info("final metrics: %s", metrics)
+    pprint.pprint(metrics)
+
+
+if __name__ == "__main__":
+    main()

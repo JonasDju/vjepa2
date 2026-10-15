@@ -16,6 +16,21 @@ from src.utils.tensors import repeat_interleave_batch, trunc_normal_
 from app.vjepa_2_1.models.utils.modules import Block
 
 
+def reorder_tokens(x, order):
+    """Per-sample reordering along dim 1: ``out[i, j] = x[i, order[i, j]]``.
+
+    ``x`` is [B, N] (mask indices) or [B, N, D] (tokens), ``order`` is [B, N]. Replaces the
+    upstream ``torch.stack([x[i, row] for i, row in enumerate(order)])``, which torch.compile
+    unrolls into one gather per sample (48 at batch 48) -- one op instead keeps the compiled
+    predictor graph smaller. ``torch.gather`` is a pure copy, and ``order`` is a permutation (no
+    repeated index), so forward and backward are bit-identical to the loop
+    (tests/vjepa_2_1/test_predictor_reorder.py).
+    """
+    if x.dim() == 3:
+        order = order.unsqueeze(-1).expand(-1, -1, x.size(-1))
+    return torch.gather(x, 1, order)
+
+
 class VisionTransformerPredictor(nn.Module):
     """Vision Transformer Predictor"""
 
@@ -56,6 +71,8 @@ class VisionTransformerPredictor(nn.Module):
         img_temporal_dim_size=None,
         teacher_embed_dim=None,
         qk_norm="none",
+        qk_norm_affine=True,
+        qk_temperature_max=None,
         **kwargs
     ):
         super().__init__()
@@ -165,6 +182,8 @@ class VisionTransformerPredictor(nn.Module):
                     interpolate_rope=interpolate_rope,
                     patch_size=patch_size,
                     qk_norm=qk_norm,
+                    qk_norm_affine=qk_norm_affine,
+                    qk_temperature_max=qk_temperature_max,
                 )
                 for i in range(depth)
             ]
@@ -202,8 +221,10 @@ class VisionTransformerPredictor(nn.Module):
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
+            if m.bias is not None:  # None for a non-affine q/k LayerNorm
+                nn.init.constant_(m.bias, 0)
+            if m.weight is not None:
+                nn.init.constant_(m.weight, 1.0)
 
     def _rescale_blocks(self):
         def rescale(param, layer_id):
@@ -255,8 +276,8 @@ class VisionTransformerPredictor(nn.Module):
         masks = torch.cat([masks_x, masks_y], dim=1)
 
         argsort = torch.argsort(masks, dim=1)
-        masks = torch.stack([masks[i, row] for i, row in enumerate(argsort)], dim=0)
-        x = torch.stack([x[i, row, :] for i, row in enumerate(argsort)], dim=0)
+        masks = reorder_tokens(masks, argsort)
+        x = reorder_tokens(x, argsort)
 
         if self.chop_last_n_tokens > 0:
             x = x[:, : -self.chop_last_n_tokens]
@@ -279,17 +300,13 @@ class VisionTransformerPredictor(nn.Module):
 
         if not self.return_all_tokens:
             reverse_argsort = torch.argsort(argsort, dim=1)
-            x = torch.stack(
-                [x[i, row, :] for i, row in enumerate(reverse_argsort)], dim=0
-            )
+            x = reorder_tokens(x, reverse_argsort)
             x = x[:, N_ctxt:, :]
             x = self.predictor_proj(x)
             return x, None
         else:
             reverse_argsort = torch.argsort(argsort, dim=1)
-            x = torch.stack(
-                [x[i, row, :] for i, row in enumerate(reverse_argsort)], dim=0
-            )
+            x = reorder_tokens(x, reverse_argsort)
             x_pred = x[:, N_ctxt:, :]
             x_context = x[:, :N_ctxt, :]
             x_pred = self.predictor_proj(x_pred)

@@ -29,10 +29,20 @@ SPEC = {
     "c1": {"cor": 4, "tra": 8},
     "c2": {"sag": 6},
 }
+# every volume is resampled to this many slices (V-JEPA 2.1 has no native-depth mode)
+DEPTH = 6
 MASK_CFGS = [
     {"aspect_ratio": [0.75, 1.5], "spatial_scale": [0.15, 0.15], "temporal_scale": [1.0, 1.0], "num_blocks": 8},
     {"aspect_ratio": [0.75, 1.5], "spatial_scale": [0.7, 0.7], "temporal_scale": [1.0, 1.0], "num_blocks": 2},
 ]
+
+
+def _channel_last(t):
+    """kneeno returns channel-first ``(1, D, H, W)``; ``MIDataset`` flips it back to
+    the channel-last ``(D, H, W, 1)`` layout VideoTransform expects. Mirror that
+    flip here so parity assertions compare like with like."""
+    arr = t.numpy() if torch.is_tensor(t) else t
+    return np.moveaxis(arr, 0, -1)
 
 
 def make_dataset(root):
@@ -46,9 +56,9 @@ def make_dataset(root):
             for i in range(n):
                 arr = rng.integers(0, 256, size=(H, W), dtype=np.uint8)
                 Image.fromarray(arr, mode="L").save(d / f"{i:03d}.jpeg")
-            meta[case_id][name] = {"n_images": n, "resolution": [H, W]}
+            meta[case_id][name] = {"dimensions": [H, W, n]}
     p = Path(root) / "metadata.json"
-    p.write_text(json.dumps(meta))
+    p.write_text(json.dumps({"train": meta}))  # KneeNo pretrains on the global splits "train" + "unlabeled"
     return str(p)
 
 
@@ -60,8 +70,8 @@ class MIDatasetWrapperTest(unittest.TestCase):
         self.meta = make_dataset(self.root)
 
     def test_sample_matches_raw_loader(self):
-        core = UnlabeledKneeMRIDataset(self.root, self.meta)
-        wrapped = MIDataset(self.root, self.meta, transform=None)
+        core = UnlabeledKneeMRIDataset(self.root, self.meta, series_depth=DEPTH)
+        wrapped = MIDataset(self.root, self.meta, series_depth=DEPTH, transform=None)
 
         self.assertEqual(len(wrapped), len(core))
         self.assertEqual(len(wrapped), 5)
@@ -69,35 +79,35 @@ class MIDatasetWrapperTest(unittest.TestCase):
             buffer, label, clip_indices = wrapped[i]
             self.assertEqual(label, 0)
             self.assertEqual(len(buffer), 1)
-            self.assertTrue(np.array_equal(buffer[0], core[i].numpy()))
+            self.assertTrue(np.array_equal(buffer[0], _channel_last(core[i])))
             self.assertEqual(buffer[0].dtype, np.uint8)
             self.assertEqual(len(clip_indices), 1)
             self.assertTrue(
-                np.array_equal(clip_indices[0], np.arange(core.effective_depth(i)))
+                np.array_equal(clip_indices[0], np.arange(DEPTH))
             )
 
     def test_transform_is_applied_to_raw_volume(self):
-        core = UnlabeledKneeMRIDataset(self.root, self.meta)
+        core = UnlabeledKneeMRIDataset(self.root, self.meta, series_depth=DEPTH)
         calls = []
 
         def fake_transform(vol):
             calls.append(vol)
             return torch.as_tensor(vol).permute(3, 0, 1, 2).float()
 
-        wrapped = MIDataset(self.root, self.meta, transform=fake_transform)
+        wrapped = MIDataset(self.root, self.meta, series_depth=DEPTH, transform=fake_transform)
         buffer, _, _ = wrapped[2]
-        self.assertTrue(np.array_equal(calls[0], core[2].numpy()))
+        self.assertTrue(np.array_equal(calls[0], _channel_last(core[2])))
         self.assertTrue(
             torch.equal(
                 buffer[0],
-                torch.as_tensor(core[2].numpy()).permute(3, 0, 1, 2).float(),
+                torch.as_tensor(_channel_last(core[2])).permute(3, 0, 1, 2).float(),
             )
         )
 
     def test_flows_through_mask_collator(self):
         collator = MaskCollator(
             cfgs_mask=MASK_CFGS,
-            dataset_fpcs=[4, 6, 8],
+            dataset_fpcs=[DEPTH],
             crop_size=64,
             patch_size=16,
             tubelet_size=2,
@@ -106,6 +116,7 @@ class MIDatasetWrapperTest(unittest.TestCase):
             data_root=self.root,
             data_meta=self.meta,
             batch_size=2,
+            series_depth=DEPTH,  # the fixture's native depths are 4, 6 and 8
             transform=None,
             collator=collator,
             num_workers=0,
@@ -117,12 +128,18 @@ class MIDatasetWrapperTest(unittest.TestCase):
         batches = list(loader)
         self.assertTrue(batches, "sampler produced no batches")
         for fpc_collations in batches:
-            self.assertEqual(len(fpc_collations), 1)  # single-depth batches
+            self.assertEqual(len(fpc_collations), 1)  # one fpc: every volume has DEPTH slices
             collated_batch, masks_enc, masks_pred = fpc_collations[0]
             clips = collated_batch[0][0]  # buffer list -> first (only) entry, collated
             self.assertEqual(clips.shape[0], 2)  # batch_size
             self.assertEqual(len(masks_enc), len(MASK_CFGS))
             self.assertEqual(len(masks_pred), len(MASK_CFGS))
+
+    def test_native_depth_is_rejected(self):
+        for series_depth in (0, -1, None):
+            with self.subTest(series_depth=series_depth):
+                with self.assertRaisesRegex(ValueError, "positive number of slices"):
+                    MIDataset(self.root, self.meta, series_depth=series_depth)
 
 
 if __name__ == "__main__":

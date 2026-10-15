@@ -60,6 +60,7 @@ eval:
   training:
     early_stop_on: auroc  # val metric that picks each head's best epoch
     early_stop_patience: 5  # head epochs without a val improvement before stopping; 0 = never stop early
+    loss: BCE
   verbose: true  # log each task's start and every head epoch's val metrics
   data:
     # internal: global "train" (the heads' train/val) + "val" (the "internal" test set); external: global "test".
@@ -82,8 +83,6 @@ eval:
     tag_prefix: eval
   freq:
     knn: 1
-    linear: null  # V-JEPA 2.1 has no cls token -- explicitly override the default's freq (omitting
-                  # this key would leave the default "linear: 5" in place via the config merge)
     linear_pool: 1
     attentive_pool: 1
   knn:
@@ -93,16 +92,25 @@ eval:
     pooling: avg
     center: true  # subtract each sequence's mean feature before the per-sequence L2 normalisation
     batch_size: 32  # exams -> 128 volumes per encoder forward
+    chunk_size: 1024
   linear_pool:
     pooling: avg
-    batchnorm: true  # non-affine BatchNorm1d (z-score) in front of the linear layer
+    batchnorm: true
     max_epochs: 50
-    batch_size: 32  # exams
-    lr: 0.001
+    batch_size: 64
+    lr: 0.0015
+    warmup_epochs: 10
+    weight_decay: 0.0
   attentive_pool:
-    depth: 1
-    num_heads: 12
+    q2l: false
+    patch_sa_depth: 0
+    qa_depth: 1
+    num_heads: 16
+    mlp_ratio: 4.0
+    qkv_bias: true
+    complete_block: true
     max_epochs: 50
-    batch_size: 16  # exams
+    batch_size: 16
     lr: 0.0005
-    warmup_epochs: 5
+    warmup_epochs: 10
+    weight_decay: 0.001

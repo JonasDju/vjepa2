@@ -45,10 +45,9 @@ model:
   vit_conv: false
   zero_init_mask_tokens: true
 
-# KneeNo classification evaluation, run on the frozen (target) encoder every
-# eval.freq.<task> epochs -- see KneeNo/kneeno/evaluation/config.py for every
-# key. "linear" is explicitly disabled below: V-JEPA 2.1 has no cls token
-# (VJepa21Adapter.has_cls_token = False)
+# KneeNo classification evaluation of the frozen (target) encoder: the standalone script runs every task with
+# a non-null eval.freq.<task> > 0 once -- see KneeNo/kneeno/evaluation/config.py for every key. "linear" is
+# left out (KneeNo's default freq is null): V-JEPA 2.1 has no cls token (VJepa21Adapter.has_cls_token = False)
 eval:
   seed: 239
   encoder: target  # target (EMA) | online

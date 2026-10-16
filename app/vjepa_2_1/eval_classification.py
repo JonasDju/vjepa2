@@ -12,14 +12,15 @@ Loads a frozen encoder from a V-JEPA 2.1 pretraining checkpoint (as written by
 ``kneeno.evaluation.ClassificationEvaluator``, which trains every head on the train split with
 early stopping on val and logs one point per task and test set (``eval.data.test_sets``): its test
 metrics (the same protocol as the in-training hook in ``train.py``, which tests on ``internal`` only).
+Every task with a non-null ``eval.freq`` > 0 runs once (as in curia's and lightly-train's standalone evaluations);
+``linear`` needs a cls token, which V-JEPA 2.1 lacks, so KneeNo drops it with a warning (use ``linear_pool``).
 With ``eval.verbose`` the per-head-epoch val metrics show the progress in the log.
 
 Usage::
 
     .venv/bin/python -m app.vjepa_2_1.eval_classification \\
         --fname configs/eval_2_1/vitb-384/medical_imaging.yaml \\
-        --checkpoint /path/to/latest.pth.tar \\
-        --tasks knn linear_pool attentive_pool
+        --checkpoint /path/to/latest.pth.tar
 
 Use a standalone eval config like that one, not a pretraining config: those set
 ``eval.data.abort_on_io_error: false``, which replaces an exam that fails to load with a random one
@@ -46,7 +47,8 @@ import yaml
 from app.vjepa_2_1.utils import init_video_model
 from app.vjepa_2_1.train import NORMALIZE_MI, NORMALIZE_RGB
 from kneeno.config import expand_env_vars
-from kneeno.evaluation import ClassificationEvaluator
+from kneeno.evaluation import ClassificationEvaluator, load_eval_config
+from kneeno.evaluation.config import ALL_TASKS
 from src.datasets.kneeno_adapter import VJepa21Adapter
 from src.datasets.mi_dataset import check_series_depth
 from src.utils.checkpoint_loader import robust_checkpoint_loader
@@ -70,17 +72,18 @@ def parse_args():
         default=None,
         help="which encoder to evaluate; defaults to the config's eval.encoder (else 'target', i.e. the EMA encoder)",
     )
-    parser.add_argument(
-        "--tasks",
-        type=str,
-        nargs="+",
-        default=None,
-        choices=["knn", "linear_pool", "attentive_pool"],
-        help="subset of tasks to run; defaults to every task V-JEPA 2.1 supports (knn, linear_pool, "
-        "attentive_pool; 'linear' needs a cls token, use linear_pool instead)",
-    )
     parser.add_argument("--device", type=str, default="cpu", help="e.g. 'cpu' or 'cuda:0'")
     return parser.parse_args()
+
+
+def enabled_tasks(freq):
+    """The tasks whose frequency is set, with ``kneeno.tasks_due``'s semantics: a missing key keeps KneeNo's
+    default (``freq`` is the merged config), null or ``<= 0`` is off. There is only one evaluation, so the value
+    itself does not matter."""
+    tasks = [task for task in ALL_TASKS if freq.get(task) is not None and freq[task] > 0]
+    if not tasks:
+        raise ValueError(f"No task is enabled: every task in eval.freq is null or <= 0 ({freq}).")
+    return tasks
 
 
 def build_encoder(cfgs_data, cfgs_model, in_chans, max_num_frames, device):
@@ -155,6 +158,8 @@ def main():
     cfgs_eval = config.get("eval")
     if cfgs_eval is None:
         raise ValueError(f"{args.fname} has no 'eval:' block")
+    tasks = enabled_tasks(load_eval_config(cfgs_eval)["freq"])
+    logger.info(f"evaluating tasks {tasks}")
 
     # Abort if evaluation results already exist
     label_dir = cfgs_eval.get("logging").get("per_label_dir")
@@ -199,7 +204,7 @@ def main():
 
     evaluator = ClassificationEvaluator(config=cfgs_eval, adapter=adapter, device=device)
     try:
-        metrics = evaluator.evaluate(encoder, tasks=args.tasks, epoch=0)
+        metrics = evaluator.evaluate(encoder, tasks=tasks, epoch=0)
     finally:
         # Flush+close the TensorBoard writer so buffered scalars are not lost
         # if the process exits right after

@@ -143,6 +143,7 @@ class EvalClassificationCliTest(unittest.TestCase):
                     "num_workers": 0,
                 },
                 "logging": {"tensorboard_dir": str(self.tb_dir)},
+                "freq": {"knn": 1, "linear_pool": 1, "attentive_pool": 1},
                 "knn": {"k": [3]},
                 "linear_pool": {"max_epochs": 2, "batch_size": 4},
                 "attentive_pool": {"max_epochs": 2, "batch_size": 4, "num_heads": 4},
@@ -175,6 +176,16 @@ class EvalClassificationCliTest(unittest.TestCase):
                 ) as to_uint8:
                     self._run_and_check_tensorboard()
                 self.assertEqual(to_uint8.called, "external" in test_sets)
+
+    def test_no_enabled_task_is_rejected_up_front(self):
+        # The tasks are those with a non-null eval.freq > 0; KneeNo's defaults are all null.
+        self._make_datasets()
+        self._make_config(series_depth=NUM_FRAMES)
+        config = yaml.safe_load(self.config_path.read_text())
+        config["eval"]["freq"] = {"knn": 0, "linear_pool": None}
+        self.config_path.write_text(yaml.dump(config))
+        with self.assertRaisesRegex(ValueError, "No task is enabled"):
+            self._run_main()
 
     def test_native_depth_is_rejected_up_front(self):
         # V-JEPA 2.1 has no native-depth mode: the encoder is sized for eval.data.series_depth and
@@ -249,10 +260,6 @@ class EvalClassificationCliTest(unittest.TestCase):
             str(self.config_path),
             "--checkpoint",
             str(self.checkpoint_path),
-            "--tasks",
-            "knn",
-            "linear_pool",
-            "attentive_pool",
             "--device",
             "cpu",
         ]

@@ -161,7 +161,9 @@ bridge and the wiring.
   `forward_features` unwraps DDP and calls the `MultiSeqWrapper`-wrapped encoder directly.
   `has_cls_token = False` always — `VisionTransformer.cls_token` is unconditionally `None`
   (`app/vjepa_2_1/models/vision_transformer.py`), so the `linear` task is unavailable for
-  this model; use `linear_pool` instead. Selecting `linear` anyway raises `ValueError`.
+  this model; use `linear_pool` instead. Selecting `linear` anyway only logs a warning:
+  `ClassificationEvaluator` drops tasks the adapter cannot serve (`TASK_REQUIRES` in KneeNo's
+  `classification.py`).
 - `app/vjepa_2_1/train.py` — builds one `ClassificationEvaluator` (guarded by the
   presence of an `eval:` config block) after the encoder/target_encoder are constructed
   and checkpoint-loaded, then calls `evaluator.evaluate(...)` at the end of every epoch
@@ -196,8 +198,10 @@ bridge and the wiring.
   ```bash
   .venv/bin/python -m app.vjepa_2_1.eval_classification \
     --fname configs/eval_2_1/vitb-384/medical_imaging.yaml \
-    --checkpoint /path/to/latest.pth.tar --tasks knn linear_pool attentive_pool
+    --checkpoint /path/to/latest.pth.tar
   ```
+  It runs every task with a non-null `eval.freq` > 0 once (no `--tasks` flag since 2026-10-16, like curia's,
+  lightly-train's and 3DINO's standalone evals); a config with none enabled raises.
   Don't pass a pretraining config: its `abort_on_io_error: false` lets a broken exam be replaced by another
   one, and it tests on `internal` only.
   **Before the strict-loading fix this script evaluated a randomly initialised encoder** on
@@ -214,12 +218,9 @@ KneeNo's global splits: `split.val_fraction` cuts the internal `train` split int
 `early_stop_patience`, `verbose`, and `max_epochs` (not `epochs`) per head task. Old keys
 (`epochs`, `split.train_fraction` / `test_fraction`, `data.dataset_type`) are rejected at load. See
 `configs/train_2_1/vitb16/pretrain-MI-256px-24f.yaml` for a real example, and
-`KneeNo/kneeno/evaluation/config.py::DEFAULT_EVAL_CONFIG` for every key/default. **Trap
-to watch for:** config merging is a deep-merge over the defaults, so disabling a task
-that has a nonzero *default* frequency (`linear` defaults to 5) requires an *explicit*
-`freq: {linear: null, ...}` in the YAML — omitting the key silently leaves the default
-enabled. This matters here specifically because `linear` is unavailable for this model
-and selecting it raises.
+`KneeNo/kneeno/evaluation/config.py::DEFAULT_EVAL_CONFIG` for every key/default. The config is
+deep-merged over the defaults. Since KneeNo `77839f0` (2026-10-15) every `freq` defaults to null,
+so a task runs only if the YAML sets its frequency; leaving `linear` out is enough to disable it.
 
 **Status:** the evaluator builds a `KneeNoEvalDataset` from `eval.data` (`KneeNo/kneeno/evaluation/dataset.py`;
 layouts/schemas in `KneeNo/README.md`): the train part is `LabeledInternalKneeMRIDataset(split="train")`, the JPEG

@@ -255,7 +255,8 @@ class ClassificationEvaluatorAgainstVJepaEncoderTest(unittest.TestCase):
             "split": {"val_fraction": 0.3},
             "data": {"series_depth": NUM_FRAMES, "num_workers": 0},
             "logging": {"tensorboard_dir": None},
-            "knn": {"k": [3], "batch_size": 4},
+            "knn": {"k": [3]},
+            "extraction_batch_size": 4,
             "linear_pool": {"max_epochs": 1, "batch_size": 4},
             "attentive_pool": {"max_epochs": 1, "batch_size": 4, "num_heads": 4},
         }

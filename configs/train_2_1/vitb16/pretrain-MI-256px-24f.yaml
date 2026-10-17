@@ -142,6 +142,7 @@ eval:
   amp_dtype: bfloat16  # frozen-encoder forward under autocast (CUDA only); null -> float32. Heads still train in float32.
   cache_features: true  # linear / linear_pool train on embeddings extracted once per evaluation instead of
                         # re-encoding every head epoch; k-NN always uses the shared pass. attentive_pool never caches.
+  extraction_batch_size: 32  # exams -> at most 128 volumes per encoder forward (cache pass and re-encoding heads)
   split:  # the internal global "train" split (pretrained on) is cut into train and val; the test sets are used whole
     val_fraction: 0.2  # heads are scored on val every head epoch (early stopping)
   training:
@@ -157,6 +158,7 @@ eval:
     series_depth: 24  # match the series_depth above -- no resampling distribution shift
     resample_mode: nearest
     num_workers: 16
+    prefetch_factor: 2  # batches each worker loads ahead; worker RAM in flight ~ num_workers * prefetch_factor batches
     subset: 12500  # seeded subsample of the internal "train" EXAMS (test sets always whole): float in (0, 1] = fraction, int > 1 = count, 1.0 = all
     abort_on_io_error: false  # a broken exam is replaced by a random other one of its part (a val exam may become a train exam) instead of killing the run
     multiprocessing_context: fork  # eval DataLoader worker start method; null -> inherit. Workers must never touch CUDA
@@ -174,13 +176,13 @@ eval:
     temperature: 0.07
     pooling: avg
     center: true  # subtract each sequence's mean feature before the per-sequence L2 normalisation
-    batch_size: 32  # exams -> 128 volumes per encoder forward
     chunk_size: 1024
   linear_pool:
     pooling: avg
     batchnorm: true  # non-affine BatchNorm1d (z-score) in front of the linear layer
     max_epochs: 30
     batch_size: 64  # exams
+    grad_accum_steps: 1  # must stay 1 with batchnorm: true
     lr: 0.0015
     warmup_epochs: 5
     weight_decay: 0.0

@@ -215,8 +215,11 @@ consumed by both the in-training hook and the standalone script. Since 2026-10-1
 KneeNo's global splits: `split.val_fraction` cuts the internal `train` split into the heads' train and val,
 `eval.data.test_sets` names the test sets (`internal` = internal `val`, `external` = the external dataset),
 `data_root` / `label_meta` are `{internal: ..., external: ...}` mappings; plus `training.early_stop_on` /
-`early_stop_patience`, `verbose`, and `max_epochs` (not `epochs`) per head task. Old keys
-(`epochs`, `split.train_fraction` / `test_fraction`, `data.dataset_type`) are rejected at load. See
+`early_stop_patience_global`, `verbose`, and `max_epochs` (not `epochs`) and an optional `early_stop_patience`
+(overrides the global one) per head task. The pretraining configs keep the global patience at 0 (no early stopping)
+with no per-task override; the standalone eval config also has global 0, but `attentive_pool` (re-encodes every
+epoch, no feature cache) sets `early_stop_patience: 10`. Old keys (`epochs`, `split.train_fraction` /
+`test_fraction`, `data.dataset_type`, `training.early_stop_patience`) are rejected at load. See
 `configs/train_2_1/vitb16/pretrain-MI-256px-24f.yaml` for a real example, and
 `KneeNo/kneeno/evaluation/config.py::DEFAULT_EVAL_CONFIG` for every key/default. The config is
 deep-merged over the defaults. Since KneeNo `77839f0` (2026-10-15) every `freq` defaults to null,

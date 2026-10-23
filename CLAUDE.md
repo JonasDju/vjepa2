@@ -173,7 +173,8 @@ bridge and the wiring.
   `linear_pool` running several internal head-training epochs (early-stopped on val). The pretraining
   configs test on `internal` only (`eval.data.test_sets: [internal]`, exams never pretrained on): compare
   epochs by the `internal/*` curves. Each trained head also logs `evaluation_val/<task>/val_auroc` (val exams
-  were pretrained on). The pretraining configs set `eval.data.abort_on_io_error: false` (an exam that fails to
+  were pretrained on) and its `evaluation_val/<task>/lr`, and k-NN each k's `evaluation_val/knn/k<k>/val_auroc`
+  and `.../temperature`. The pretraining configs set `eval.data.abort_on_io_error: false` (an exam that fails to
   load is replaced by a random one rather than killing the run).
   Called on every rank; `ClassificationEvaluator` only does work on rank 0 internally
   (barrier + broadcast), so this is safe under DDP without any rank-guarding here.
@@ -214,12 +215,20 @@ bridge and the wiring.
 consumed by both the in-training hook and the standalone script. Since 2026-10-14 it uses
 KneeNo's global splits: `split.val_fraction` cuts the internal `train` split into the heads' train and val,
 `eval.data.test_sets` names the test sets (`internal` = internal `val`, `external` = the external dataset),
-`data_root` / `label_meta` are `{internal: ..., external: ...}` mappings; plus `training.early_stop_on` /
+`data_root` / `label_meta` are `{internal: ..., external: ...}` mappings; plus `training.monitor_metric` /
 `early_stop_patience_global`, `verbose`, and `max_epochs` (not `epochs`) and an optional `early_stop_patience`
 (overrides the global one) per head task. The pretraining configs keep the global patience at 0 (no early stopping)
 with no per-task override; the standalone eval config also has global 0, but `attentive_pool` (re-encodes every
-epoch, no feature cache) sets `early_stop_patience: 10`. Old keys (`epochs`, `split.train_fraction` /
-`test_fraction`, `data.dataset_type`, `training.early_stop_patience`) are rejected at load. See
+epoch, no feature cache) sets `early_stop_patience: 5`.
+- Since 2026-10-23 every config also sets `encoder_amp_dtype: bfloat16` and `head_amp_dtype: null`, and
+  `compile_attentive_heads` (`true` in the standalone eval config, `false` in the pretraining configs).
+- The standalone eval config sweeps `linear_pool.lr` (`[0.0001, ..., 0.02]`, 8 values) and `knn.temperature`
+  (`[0.01, ..., 1.0]`, 8 values). The pretraining configs keep a single value each.
+- Its `attentive_pool` trains with `lr: 0.0005`, batch 64 as 4 micro-batches of 16, `max_epochs: 15`,
+  `warmup_epochs: 3`.
+
+Old keys (`epochs`, `split.train_fraction` / `test_fraction`, `data.dataset_type`, `training.early_stop_patience`,
+`training.early_stop_on`, `amp_dtype`) are rejected at load. See
 `configs/train_2_1/vitb16/pretrain-MI-256px-24f.yaml` for a real example, and
 `KneeNo/kneeno/evaluation/config.py::DEFAULT_EVAL_CONFIG` for every key/default. The config is
 deep-merged over the defaults. Since KneeNo `77839f0` (2026-10-15) every `freq` defaults to null,

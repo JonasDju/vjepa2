@@ -213,8 +213,10 @@ bridge and the wiring.
 
 **Config**: an `eval:` block at the YAML top level (sibling of `data:`/`model:`/etc.),
 consumed by both the in-training hook and the standalone script. Since 2026-10-14 it uses
-KneeNo's global splits: `split.val_fraction` cuts the internal `train` split into the heads' train and val,
-`eval.data.test_sets` names the test sets (`internal` = internal `val`, `external` = the external dataset),
+KneeNo's global splits. Since 2026-10-28 the heads' train and val are one split of KneeNo's split manifest
+(`split.manifest` / `level` / `rep`, see `MA/CLAUDE.md`): the pretraining configs use `level: 0.25, rep: 0` (they
+had `data.subset: 12500` before), the standalone eval config `level: 1.0, rep: 0` (one run per level and rep to
+report). `eval.data.test_sets` names the test sets (`internal` = internal `val`, `external` = the external dataset),
 `data_root` / `label_meta` are `{internal: ..., external: ...}` mappings; plus `training.monitor_metric` /
 `early_stop_patience_global`, `verbose`, and `max_epochs` (not `epochs`) and an optional `early_stop_patience`
 (overrides the global one) per head task. The pretraining configs keep the global patience at 0 (no early stopping)
@@ -227,8 +229,9 @@ epoch, no feature cache) sets `early_stop_patience: 5`.
 - Its `attentive_pool` trains with `lr: 0.0005`, batch 64 as 4 micro-batches of 16, `max_epochs: 15`,
   `warmup_epochs: 3`.
 
-Old keys (`epochs`, `split.train_fraction` / `test_fraction`, `data.dataset_type`, `training.early_stop_patience`,
-`training.early_stop_on`, `amp_dtype`) are rejected at load. See
+Old keys (`epochs`, `split.train_fraction` / `test_fraction` / `val_fraction`, `data.subset`, `data.dataset_type`,
+`training.early_stop_patience`, `training.early_stop_on`, `amp_dtype`) are rejected at load. The tests write a
+manifest for their fixture with `kneeno.evaluation.splits.write_manifest_for` / `write_manifest_for_metadata`. See
 `configs/train_2_1/vitb16/pretrain-MI-256px-24f.yaml` for a real example, and
 `KneeNo/kneeno/evaluation/config.py::DEFAULT_EVAL_CONFIG` for every key/default. The config is
 deep-merged over the defaults. Since KneeNo `77839f0` (2026-10-15) every `freq` defaults to null,
@@ -249,7 +252,7 @@ KneeNo), not from the config, and an unknown `source` raises; so one evaluation 
 `init_data` got `"internal"` and failed (since 7cc546e, 2026-10-05). Checkpoints pretrained before the global
 splits saw the internal `val` exams: only their `external` numbers are clean. Evaluation is
 exam-level: one sample = the four sequence volumes of one exam (see `MA/CLAUDE.md`), and every
-`eval.*.batch_size` / `eval.data.subset` counts exams, so the encoder sees 4x `batch_size` volumes. `series_depth` under `eval.data` should match
+`eval.*.batch_size` counts exams, so the encoder sees 4x `batch_size` volumes. `series_depth` under `eval.data` should match
 `data.series_depth` (both must be `> 0`; checked at startup by `train.py`). The standalone
 script has no pretraining `data.series_depth`: it builds the encoder with `eval.data.series_depth`
 and checks only that one. Set it to the pretraining depth. `SimpleITK` must be

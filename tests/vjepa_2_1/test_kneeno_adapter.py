@@ -13,6 +13,7 @@ actual patch-embedding / forward path, not just the adapter's own logic.
 
 import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -22,6 +23,7 @@ from app.vjepa_2_1.train import NORMALIZE_MI, NORMALIZE_RGB
 from app.vjepa_2_1.utils import init_video_model
 from app.vjepa_2_1.wrappers import MultiSeqWrapper
 from kneeno import ClassificationEvaluator, LabeledExternalKneeMRIDataset
+from kneeno.evaluation.splits import write_manifest_for
 from src.datasets.kneeno_adapter import VJepa21Adapter
 from tests.vjepa_2_1.labeled_fixture import EXTERNAL_SEQUENCES, full_exam_spec, make_eval_dataset
 
@@ -244,6 +246,7 @@ class ClassificationEvaluatorAgainstVJepaEncoderTest(unittest.TestCase):
         self.dataset = make_eval_dataset(
             self._tmp.name, SPEC, 3, h=H, w=W, series_depth=NUM_FRAMES, resample_mode="nearest"
         )
+        self.manifest = write_manifest_for(self.dataset, Path(self._tmp.name) / "split_manifest.json", val_fraction=0.3)
         self.model = make_tiny_encoder()
         self.adapter = VJepa21Adapter(
             embed_dim=EMBED_DIM, crop_size=CROP_SIZE, normalize=((0.5,), (0.5,))
@@ -252,7 +255,7 @@ class ClassificationEvaluatorAgainstVJepaEncoderTest(unittest.TestCase):
     def _config(self, **overrides):
         config = {
             "seed": 3,
-            "split": {"val_fraction": 0.3},
+            "split": {"manifest": str(self.manifest), "level": 1.0, "rep": 0},
             "data": {"series_depth": NUM_FRAMES, "num_workers": 0},
             "logging": {"tensorboard_dir": None},
             "knn": {"k": [3]},

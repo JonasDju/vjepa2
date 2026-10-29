@@ -20,6 +20,7 @@ import torch
 import yaml
 
 from kneeno import LabeledExternalKneeMRIDataset
+from kneeno.evaluation.splits import write_manifest_for_metadata
 
 from app.vjepa_2_1.utils import init_video_model
 from tests.vjepa_2_1.labeled_fixture import (
@@ -64,6 +65,9 @@ class EvalClassificationCliTest(unittest.TestCase):
             ),
             "external": make_labeled_dataset(self.data_root["external"], EXTERNAL_SPEC, h=H, w=W),
         }
+        self.manifest = write_manifest_for_metadata(
+            self.label_meta["internal"], self.root / "split_manifest.json", val_fraction=0.3
+        )
 
     def _make_checkpoint(self, in_chans=1, qk_norm="rms"):
         encoder, predictor = init_video_model(
@@ -133,7 +137,7 @@ class EvalClassificationCliTest(unittest.TestCase):
             },
             "eval": {
                 "seed": 1,
-                "split": {"val_fraction": 0.3},
+                "split": {"manifest": str(self.manifest), "level": 1.0, "rep": 0},
                 "data": {
                     "data_root": self.data_root,
                     "label_meta": self.label_meta,

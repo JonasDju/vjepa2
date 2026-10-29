@@ -195,12 +195,32 @@ bridge and the wiring.
   scored on both) and sets `eval.data.abort_on_io_error: true`: an exam that fails to load raises instead of
   being replaced by another one. Its `label_meta.external` is `/hpcwork/p0021834/workspace_roman/jonas/metadata/external_labeled.json`, and
   `$TMP/kneeno_data/external` must be extracted first (KneeNo `prepare_data.py --external-tar
-  /hpcwork/p0021834/workspace_roman/jonas/uka_gold_nifti.tar`; this repo has no submit script that does it). Run as:
+  /hpcwork/p0021834/workspace_roman/jonas/uka_gold_nifti.tar`). Submit it with
+  `sbatch --export=ALL,CHECKPOINT=<.pth.tar> app/vjepa_2_1/submit_eval_classification.sh` (since 2026-10-29), which
+  extracts both datasets to `$TMP/kneeno_data` first, or run it by hand:
   ```bash
+  CONFIG_FILE_NAME=medical_imaging SPLIT_LEVEL=1.0 SPLIT_REP=0 TMP=... \
   .venv/bin/python -m app.vjepa_2_1.eval_classification \
     --fname configs/eval_2_1/vitb-384/medical_imaging.yaml \
     --checkpoint /path/to/latest.pth.tar
   ```
+  - **The submit script** is curia's / lightly-train's (1 GPU, 1 task, 32 CPUs, 24 h; `--device cuda:0`). Env vars
+    (pass with `--export=ALL,...`: RWTH's sbatch uses `--export=NONE`): `CHECKPOINT` (required, no default: the
+    config's `model:` block must describe it, e.g. `n_channels: 3` / `qk_norm: none` for the official ones, or the
+    strict load fails after the data extraction), `CONFIG` (default
+    `configs/eval_2_1/vitb-384/medical_imaging.yaml`) **or** `CONFIG_BASE_DIR` + `CONFIG_FILE_NAME` (a config in it
+    without the `.yaml`; set together, not with `CONFIG`), `REPO_DIR`, `KNEENO_DIR`, `SPLIT_LEVEL` / `SPLIT_REP`
+    (default `1.0` / `0`). Config, checkpoint and KneeNo are checked before the data extraction.
+  - It exports `CONFIG_FILE_NAME` as the config's file name without the `.yaml` either way, and the script raises
+    unless `${CONFIG_FILE_NAME}.yaml` is its `--fname`'s name. The eval config writes to
+    `.../type-${CONFIG_FILE_NAME}.level-${SPLIT_LEVEL}.rep-${SPLIT_REP}/` (its `<MODEL_DIR>` placeholder is still
+    a literal to edit). An env var the config uses but the environment lacks is an error (since 2026-10-29; before,
+    `expand_env_vars` left it in the path).
+  - **Job logs**: `slurm_logs/type-<CONFIG_FILE_NAME>.level-<SPLIT_LEVEL>.rep-<SPLIT_REP>.<job id>.log` in the
+    submit directory: `--output` is `slurm_logs/%j.log`, renamed (`mv -n`) once the config and split are resolved
+    (SLURM keeps writing to the open file). Invalid `CONFIG*` vars exit before that, so their error stays in
+    `slurm_logs/<job id>.log`. `slurm_logs/` is tracked (its own `.gitignore`) because SLURM doesn't create it.
+    `tests/vjepa_2_1/test_submit_eval_classification.py` runs the script with `srun` and the venv's python stubbed.
   It runs every task with a non-null `eval.freq` > 0 once (no `--tasks` flag since 2026-10-16, like curia's,
   lightly-train's and 3DINO's standalone evals); a config with none enabled raises.
   Don't pass a pretraining config: its `abort_on_io_error: false` lets a broken exam be replaced by another
@@ -219,8 +239,8 @@ bridge and the wiring.
 consumed by both the in-training hook and the standalone script. Since 2026-10-14 it uses
 KneeNo's global splits. Since 2026-10-28 the heads' train and val are one split of KneeNo's split manifest
 (`split.manifest` / `level` / `rep`, see `MA/CLAUDE.md`): the pretraining configs use `level: 0.25, rep: 0` (they
-had `data.subset: 12500` before), the standalone eval config `level: 1.0, rep: 0` (one run per level and rep to
-report). `eval.data.test_sets` names the test sets (`internal` = internal `val`, `external` = the external dataset),
+had `data.subset: 12500` before), the standalone eval config `level: ${SPLIT_LEVEL}, rep: ${SPLIT_REP}` (from the submit script;
+one run per level and rep to report). `eval.data.test_sets` names the test sets (`internal` = internal `val`, `external` = the external dataset),
 `data_root` / `label_meta` are `{internal: ..., external: ...}` mappings; plus `training.monitor_metric` /
 `early_stop_patience_global`, `verbose`, and `max_epochs` (not `epochs`) and an optional `early_stop_patience`
 (overrides the global one) per head task. The pretraining configs keep the global patience at 0 (no early stopping)

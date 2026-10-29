@@ -21,8 +21,13 @@ dataset and split are loaded, before evaluating) and the final metrics (``result
 lightly-train's and 3DINO's standalone evaluations); without a ``per_label_dir``, only ``results.json``, next to the
 checkpoint. It refuses to start if earlier results exist.
 
-Usage::
+Environment variables are expanded in every string value of the config; an unset one is an error. If
+``CONFIG_FILE_NAME`` is set (``submit_eval_classification.sh`` exports it, and the shipped config names its output
+folders with it), it must be the config's file name without the ``.yaml``.
 
+Submit through ``app/vjepa_2_1/submit_eval_classification.sh``; that also prepares the node-local data first. Usage::
+
+    CONFIG_FILE_NAME=medical_imaging SPLIT_LEVEL=1.0 SPLIT_REP=0 TMP=... \\
     .venv/bin/python -m app.vjepa_2_1.eval_classification \\
         --fname configs/eval_2_1/vitb-384/medical_imaging.yaml \\
         --checkpoint /path/to/latest.pth.tar
@@ -46,6 +51,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import argparse
 import json
 import pprint
+import re
 from pathlib import Path
 
 import torch
@@ -64,6 +70,35 @@ logger = get_logger(__name__, force=True)
 # maps yaml eval.encoder / --encoder argument -> candidate keys in the checkpoint dict, first present one wins:
 # save_checkpoint() writes "target_encoder", the official V-JEPA 2.1 checkpoints call the EMA encoder "ema_encoder"
 ENCODER_STATE_DICT_KEYS = {"target": ("target_encoder", "ema_encoder"), "online": ("encoder",)}
+
+
+# What os.path.expandvars expands when the variable is set, i.e. what is left of an unset one
+_ENV_VAR_PATTERN = re.compile(r"\$(\{\w+\}|[A-Za-z_]\w*)")
+
+
+def check_config_env(config, config_path):
+    """Raise if the expanded config still uses an env var, or names another config than ``config_path``.
+
+    ``expand_env_vars`` leaves an unset variable as it is, which would create a literal ``${VAR}`` directory. The
+    submit script exports ``CONFIG_FILE_NAME``, the config's file name without the ``.yaml``, which names the output
+    folders: it must name this file.
+    """
+    unset = sorted(set(_find_env_vars(config)))
+    if unset:
+        raise ValueError(f"{config_path} uses environment variables that are not set: {unset}")
+    file_name = os.environ.get("CONFIG_FILE_NAME")
+    if file_name is not None and f"{file_name}.yaml" != Path(config_path).name:
+        raise ValueError(f"CONFIG_FILE_NAME={file_name!r} does not name the eval config {config_path}")
+
+
+def _find_env_vars(obj):
+    if isinstance(obj, dict):
+        return [var for value in obj.values() for var in _find_env_vars(value)]
+    if isinstance(obj, (list, tuple)):
+        return [var for value in obj for var in _find_env_vars(value)]
+    if isinstance(obj, str):
+        return [match.group(0) for match in _ENV_VAR_PATTERN.finditer(obj)]
+    return []
 
 
 def parse_args():
@@ -167,6 +202,7 @@ def main():
     with open(args.fname, "r") as f:
         config = expand_env_vars(yaml.load(f, Loader=yaml.FullLoader))
     logger.info("loaded config:\n%s", pprint.pformat(config))
+    check_config_env(config, args.fname)
 
     cfgs_eval = config.get("eval")
     if cfgs_eval is None:

@@ -11,6 +11,7 @@ checkpoint loading, and the standalone call into ``ClassificationEvaluator`` in 
 """
 
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -234,6 +235,28 @@ class EvalClassificationCliTest(unittest.TestCase):
         self.config_path.write_text(yaml.dump(config))
         with self.assertRaisesRegex(ValueError, "No task is enabled"):
             self._run_main()
+
+    def test_config_env_is_checked_up_front(self):
+        # expand_env_vars leaves an unset variable as it is, which would create a literal ${VAR} directory; and
+        # CONFIG_FILE_NAME (exported by the submit script) names the output folders, so it must name the config
+        from app.vjepa_2_1.eval_classification import check_config_env
+
+        self._make_datasets()
+        self._make_config(series_depth=NUM_FRAMES)
+        config = yaml.safe_load(self.config_path.read_text())
+        config["eval"]["logging"]["per_label_dir"] = str(self.out_dir / "type-${CONFIG_FILE_NAME}" / "per_label")
+        self.config_path.write_text(yaml.dump(config))
+        with mock.patch.dict(os.environ):
+            os.environ.pop("CONFIG_FILE_NAME", None)
+            with self.assertRaisesRegex(ValueError, r"not set: \['\$\{CONFIG_FILE_NAME\}'\]"):
+                self._run_main()
+            for wrong in ("query2label", "config.yaml"):  # another config, or the name with the .yaml
+                os.environ["CONFIG_FILE_NAME"] = wrong
+                with self.assertRaisesRegex(ValueError, "does not name the eval config"):
+                    self._run_main()
+            os.environ["CONFIG_FILE_NAME"] = "config"
+            check_config_env({"out": str(self.out_dir)}, str(self.config_path))
+        self.assertFalse(self.out_dir.exists())
 
     def test_native_depth_is_rejected_up_front(self):
         # V-JEPA 2.1 has no native-depth mode: the encoder is sized for eval.data.series_depth and

@@ -61,7 +61,7 @@ eval:
   compile_attentive_heads: true
   cache_features: true  # linear / linear_pool train on embeddings extracted once per evaluation instead of
                         # re-encoding every head epoch; k-NN always uses the shared pass. attentive_pool never caches.
-  extraction_batch_size: 32  # exams -> at most 128 volumes per encoder forward (cache pass and re-encoding heads)
+  extraction_batch_size: 12  # exams -> at most 128 volumes per encoder forward (cache pass and re-encoding heads)
   split:  # train and val: one split of the split manifest (KneeNo data/make_split_manifest.py); the test sets are used whole
     manifest: /hpcwork/p0021834/workspace_roman/jonas/metadata/internal_split_manifest.json
     level: ${SPLIT_LEVEL}  # fraction of the internal global "train" split used for train + val; one run per (level, rep) to report
@@ -81,14 +81,16 @@ eval:
     test_sets: [internal, external]  # heads are trained once and scored on both
     series_depth: 24  # match the pretraining run's data.series_depth -- also the encoder's depth
     resample_mode: nearest
-    num_workers: 31
-    prefetch_factor: 2  # batches each worker loads ahead; worker RAM in flight ~ num_workers * prefetch_factor batches
+    num_workers: 16
+    prefetch_factor: 1  # batches each worker loads ahead; worker RAM in flight ~ num_workers * prefetch_factor batches
     abort_on_io_error: true  # a broken exam is retried (5 s apart) and then raises; never replaced by another exam
     multiprocessing_context: fork  # eval DataLoader worker start method; null -> inherit. Workers must never touch CUDA
     persistent_workers: true  # keep workers alive across head epochs (ignored when num_workers = 0)
+  # One folder per (config variant, level, rep): app/vjepa_2_1/submit_eval_classification.sh exports CONFIG_FILE_NAME
+  # (this file's name without the .yaml), SPLIT_LEVEL and SPLIT_REP.
   logging:
-    tensorboard_dir: /hpcwork/va105917/vjepa/pretrain_2_1/<MODEL_DIR>/eval/post-training/level-${SPLIT_LEVEL}.rep-${SPLIT_REP}/tb
-    per_label_dir: /hpcwork/va105917/vjepa/pretrain_2_1/<MODEL_DIR>/eval/post-training/level-${SPLIT_LEVEL}.rep-${SPLIT_REP}/eval_per_label
+    tensorboard_dir: /hpcwork/va105917/vjepa/pretrain_2_1/<MODEL_DIR>/eval/post-training/type-${CONFIG_FILE_NAME}.level-${SPLIT_LEVEL}.rep-${SPLIT_REP}/tb
+    per_label_dir: /hpcwork/va105917/vjepa/pretrain_2_1/<MODEL_DIR>/eval/post-training/type-${CONFIG_FILE_NAME}.level-${SPLIT_LEVEL}.rep-${SPLIT_REP}/eval_per_label
     tag_prefix: eval
   freq:
     knn: 1
@@ -107,7 +109,7 @@ eval:
     max_epochs: 50
     batch_size: 64
     grad_accum_steps: 1  # must stay 1 with batchnorm: true
-    lr: [0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02]  # swept: the best on val is tested
+    lr: [0.00005, 0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02]  # swept: the best on val is tested
     warmup_epochs: 10
     weight_decay: 0.0
   attentive_pool:
@@ -122,6 +124,6 @@ eval:
     early_stop_patience: 5  # overrides training.early_stop_patience_global (re-encoding head, no feature cache)
     batch_size: 64
     grad_accum_steps: 4  # memory only: the head trains on micro-batches of batch_size / grad_accum_steps = 16 exams
-    lr: 0.0005
+    lr: 0.00025
     warmup_epochs: 3
-    weight_decay: 0.001
+    weight_decay: 0.1

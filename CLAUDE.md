@@ -210,8 +210,8 @@ bridge and the wiring.
   `load_state_dict(strict=False)` skipped all 182 unmatched keys silently. Any standalone
   results produced before that fix are random-encoder numbers. It also writes to the config's
   `eval.logging` dirs — point those somewhere else than the training run's own dirs.
-  In the parent of `eval.logging.per_label_dir` it writes `params.yaml` (the expanded config, after the checks
-  and the strict load, before evaluating) and `results.json` (the final metrics, since 2026-10-29; curia's and
+  In the parent of `eval.logging.per_label_dir` it writes `params.yaml` (the expanded config, once the checkpoint
+  is loaded and the evaluator has built the dataset and split, before evaluating) and `results.json` (the final metrics, since 2026-10-29; curia's and
   lightly-train's format). Without a `per_label_dir`: a warning, `results.json` next to the checkpoint, no
   `params.yaml`. Any of these or the TB dir existing makes it refuse.
 

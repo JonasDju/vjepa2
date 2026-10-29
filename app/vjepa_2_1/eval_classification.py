@@ -16,10 +16,10 @@ Every task with a non-null ``eval.freq`` > 0 runs once (as in curia's and lightl
 ``linear`` needs a cls token, which V-JEPA 2.1 lacks, so KneeNo drops it with a warning (use ``linear_pool``).
 With ``eval.verbose`` the per-head-epoch val metrics show the progress in the log.
 
-Next to ``eval.logging.per_label_dir`` the script writes the expanded config (``params.yaml``, after loading the
-checkpoint, before evaluating) and the final metrics (``results.json``, the format of curia's, lightly-train's and
-3DINO's standalone evaluations); without a ``per_label_dir``, only ``results.json``, next to the checkpoint. It
-refuses to start if earlier results exist.
+Next to ``eval.logging.per_label_dir`` the script writes the expanded config (``params.yaml``, once the checkpoint,
+dataset and split are loaded, before evaluating) and the final metrics (``results.json``, the format of curia's,
+lightly-train's and 3DINO's standalone evaluations); without a ``per_label_dir``, only ``results.json``, next to the
+checkpoint. It refuses to start if earlier results exist.
 
 Usage::
 
@@ -202,13 +202,6 @@ def main():
     encoder = load_frozen_encoder(args.checkpoint, encoder, ENCODER_STATE_DICT_KEYS[encoder_choice])
     encoder.to(device)
 
-    # Written after the checks and the strict load (a config they reject must not leave a params.yaml that makes
-    # the corrected rerun refuse), but before evaluating, so a run that crashes still records its settings.
-    if params_path is not None:
-        Path(label_dir).mkdir(parents=True, exist_ok=True)
-        with open(params_path, "w") as f:
-            yaml.dump(config, f)
-
     adapter = VJepa21Adapter(
         embed_dim=encoder.embed_dim,
         n_channels=in_chans,
@@ -217,6 +210,13 @@ def main():
     )
 
     evaluator = ClassificationEvaluator(config=cfgs_eval, adapter=adapter, device=device)
+    # Written after everything that fails fast (the checks, the strict load, and the dataset and split the evaluator
+    # builds): a config they reject must not leave a params.yaml that makes the corrected rerun refuse. But before
+    # evaluating, so a run that crashes still records its settings.
+    if params_path is not None:
+        params_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(params_path, "w") as f:
+            yaml.dump(config, f)
     try:
         metrics = evaluator.evaluate(encoder, tasks=tasks, epoch=0)
     finally:

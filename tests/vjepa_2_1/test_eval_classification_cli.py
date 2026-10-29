@@ -213,6 +213,18 @@ class EvalClassificationCliTest(unittest.TestCase):
         self.assertTrue(any(k.startswith("internal/knn/") for k in results), results)
         self.assertFalse(any(self.root.rglob("params.yaml")))
 
+    def test_split_error_leaves_no_params(self):
+        # The evaluator builds the dataset and the split; a config they reject leaves nothing that blocks the rerun.
+        self._make_datasets()
+        self._make_config(series_depth=NUM_FRAMES)
+        config = yaml.safe_load(self.config_path.read_text())
+        config["eval"]["split"]["rep"] = 99
+        self.config_path.write_text(yaml.dump(config))
+        with self.assertRaisesRegex(ValueError, "no split with level"):
+            self._run_main()
+        self.assertFalse(self.out_dir.exists())
+        self.assertFalse(self.tb_dir.exists())
+
     def test_no_enabled_task_is_rejected_up_front(self):
         # The tasks are those with a non-null eval.freq > 0; KneeNo's defaults are all null.
         self._make_datasets()

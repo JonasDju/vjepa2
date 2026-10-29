@@ -10,6 +10,8 @@ through ``sys.argv`` -- exercising config parsing, encoder reconstruction,
 checkpoint loading, and the standalone call into ``ClassificationEvaluator`` in one pass.
 """
 
+import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -121,6 +123,8 @@ class EvalClassificationCliTest(unittest.TestCase):
         # data: only holds the encoder's architecture; its depth is eval.data.series_depth
         self.test_sets = list(test_sets)
         self.tb_dir = self.root / f"tb_{'_'.join(test_sets)}"
+        # results.json and params.yaml go to its parent
+        self.out_dir = self.root / f"eval_{'_'.join(test_sets)}"
         config = {
             "data": {
                 "patch_size": PATCH_SIZE,
@@ -146,7 +150,7 @@ class EvalClassificationCliTest(unittest.TestCase):
                     "batch_size": 4,
                     "num_workers": 0,
                 },
-                "logging": {"tensorboard_dir": str(self.tb_dir)},
+                "logging": {"tensorboard_dir": str(self.tb_dir), "per_label_dir": str(self.out_dir / "per_label")},
                 "freq": {"knn": 1, "linear_pool": 1, "attentive_pool": 1},
                 "knn": {"k": [3]},
                 "linear_pool": {"max_epochs": 2, "batch_size": 4},
@@ -180,6 +184,34 @@ class EvalClassificationCliTest(unittest.TestCase):
                 ) as to_uint8:
                     self._run_and_check_tensorboard()
                 self.assertEqual(to_uint8.called, "external" in test_sets)
+
+    def test_writes_results_json_and_refuses_to_overwrite_it(self):
+        self._make_datasets()
+        self._make_config(series_depth=NUM_FRAMES)
+        self._run_main()
+        results = json.loads((self.out_dir / "results.json").read_text())
+        for task in ("knn", "linear_pool", "attentive_pool"):
+            self.assertTrue(any(k.startswith(f"internal/{task}/") for k in results), task)
+        self.assertIsInstance(results["evaluation_val/linear_pool/val_auroc"], float)
+        self.assertEqual(yaml.safe_load((self.out_dir / "params.yaml").read_text())["eval"]["freq"]["knn"], 1)
+        # results.json alone is enough to refuse
+        (self.out_dir / "params.yaml").unlink()
+        shutil.rmtree(self.out_dir / "per_label")
+        shutil.rmtree(self.tb_dir)
+        with self.assertRaisesRegex(ValueError, "already exist.*results.json"):
+            self._run_main()
+
+    def test_results_go_next_to_the_checkpoint_without_per_label_dir(self):
+        self._make_datasets()
+        self._make_config(series_depth=NUM_FRAMES)
+        config = yaml.safe_load(self.config_path.read_text())
+        config["eval"]["logging"]["per_label_dir"] = None
+        config["eval"]["freq"] = {"knn": 1}
+        self.config_path.write_text(yaml.dump(config))
+        self._run_main()
+        results = json.loads((self.checkpoint_path.parent / "results.json").read_text())
+        self.assertTrue(any(k.startswith("internal/knn/") for k in results), results)
+        self.assertFalse(any(self.root.rglob("params.yaml")))
 
     def test_no_enabled_task_is_rejected_up_front(self):
         # The tasks are those with a non-null eval.freq > 0; KneeNo's defaults are all null.

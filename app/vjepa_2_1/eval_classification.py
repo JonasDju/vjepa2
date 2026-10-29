@@ -16,6 +16,11 @@ Every task with a non-null ``eval.freq`` > 0 runs once (as in curia's and lightl
 ``linear`` needs a cls token, which V-JEPA 2.1 lacks, so KneeNo drops it with a warning (use ``linear_pool``).
 With ``eval.verbose`` the per-head-epoch val metrics show the progress in the log.
 
+Next to ``eval.logging.per_label_dir`` the script writes the expanded config (``params.yaml``, after loading the
+checkpoint, before evaluating) and the final metrics (``results.json``, the format of curia's, lightly-train's and
+3DINO's standalone evaluations); without a ``per_label_dir``, only ``results.json``, next to the checkpoint. It
+refuses to start if earlier results exist.
+
 Usage::
 
     .venv/bin/python -m app.vjepa_2_1.eval_classification \\
@@ -39,6 +44,7 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
+import json
 import pprint
 from pathlib import Path
 
@@ -138,6 +144,24 @@ def load_frozen_encoder(checkpoint_path, encoder, state_dict_keys):
     return encoder
 
 
+def get_output_paths(cfgs_eval, checkpoint_path):
+    """``results.json`` and ``params.yaml`` in the parent of ``eval.logging.per_label_dir``.
+
+    Without a ``per_label_dir`` there is no evaluation folder: ``results.json`` goes next to the checkpoint and no
+    ``params.yaml`` is written (as in lightly-train's and 3DINO's standalone evaluations).
+    """
+    label_dir = (cfgs_eval.get("logging") or {}).get("per_label_dir")
+    if label_dir is None:
+        results_path = Path(checkpoint_path).resolve().parent / "results.json"
+        logger.warning(
+            f"per_label_dir not specified in evaluation config: writing the metrics to {results_path} and not "
+            "saving the evaluation params to disk."
+        )
+        return results_path, None
+    out_dir = Path(label_dir).resolve().parent
+    return out_dir / "results.json", out_dir / "params.yaml"
+
+
 def main():
     args = parse_args()
     with open(args.fname, "r") as f:
@@ -154,22 +178,13 @@ def main():
     logger.info(f"evaluating tasks {tasks}")
 
     # Abort if evaluation results already exist
-    label_dir = cfgs_eval.get("logging").get("per_label_dir")
-    tb_dir = cfgs_eval.get("logging").get("tensorboard_dir")
-
-    if (label_dir is not None and Path(label_dir).exists() or
-        tb_dir is not None and Path(tb_dir).exists()):
-        raise ValueError(f"Evaluation results already exist on the given path (eval.logging.tensorboard_dir or eval.logging.per_label_dir).")
-
-    if label_dir is not None:
-        label_dir_path = Path(label_dir)
-        label_dir_path.mkdir(parents=True, exist_ok=True)
-
-        with open(label_dir_path.parent / "params.yaml", "w") as f:
-            yaml.dump(config, f)
-
-    else:
-        logger.warning("per_label_dir not specified in evaluation config. Skipping saving evaluation params to disk.")
+    label_dir = (cfgs_eval.get("logging") or {}).get("per_label_dir")
+    tb_dir = (cfgs_eval.get("logging") or {}).get("tensorboard_dir")
+    results_path, params_path = get_output_paths(cfgs_eval, args.checkpoint)
+    candidates = (results_path, params_path, label_dir, tb_dir)
+    existing = [str(path) for path in candidates if path is not None and Path(path).exists()]
+    if existing:
+        raise ValueError(f"Evaluation results already exist: {existing}")
 
     cfgs_model = config["model"]
     cfgs_data = config["data"]
@@ -186,6 +201,13 @@ def main():
     encoder_choice = args.encoder or cfgs_eval.get("encoder", "target")
     encoder = load_frozen_encoder(args.checkpoint, encoder, ENCODER_STATE_DICT_KEYS[encoder_choice])
     encoder.to(device)
+
+    # Written after the checks and the strict load (a config they reject must not leave a params.yaml that makes
+    # the corrected rerun refuse), but before evaluating, so a run that crashes still records its settings.
+    if params_path is not None:
+        Path(label_dir).mkdir(parents=True, exist_ok=True)
+        with open(params_path, "w") as f:
+            yaml.dump(config, f)
 
     adapter = VJepa21Adapter(
         embed_dim=encoder.embed_dim,
@@ -204,6 +226,9 @@ def main():
 
     logger.info("final metrics: %s", metrics)
     pprint.pprint(metrics)
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    results_path.write_text(json.dumps(metrics, indent=2, sort_keys=True))
+    logger.info(f"wrote the metrics to {results_path}")
 
 
 if __name__ == "__main__":

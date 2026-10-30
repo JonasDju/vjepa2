@@ -3,12 +3,13 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""V-JEPA 2.1 adapter around the model-agnostic knee-MRI dataset in KneeNo.
+"""V-JEPA 2.1 adapter around the model-agnostic pretraining dataset in KneeNo.
 
 Volume loading, metadata parsing and depth resampling live in the ``kneeno``
-package so the DINOv2 side can reuse them. This module
-only adds the V-JEPA sample format ``(buffer, label, clip_indices)`` and applies
-the V-JEPA video transform.
+package so the DINOv2 side can reuse them: ``kneeno.UnlabeledDataset``, the internal
+knee data plus, optionally, the musculoskeletal (MSK) data. This module only adds the
+V-JEPA sample format ``(buffer, label, clip_indices)`` and applies the V-JEPA video
+transform.
 """
 
 from logging import getLogger
@@ -16,13 +17,16 @@ from logging import getLogger
 import numpy as np
 import torch
 
-from kneeno.dataset import UnlabeledKneeMRIDataset
+from kneeno.dataset import UnlabeledDataset
 
 logger = getLogger(__name__)
 
 
 class MIDataset(torch.utils.data.Dataset):
-    """Wrap ``kneeno.UnlabeledKneeMRIDataset`` to yield V-JEPA training samples.
+    """Wrap ``kneeno.UnlabeledDataset`` to yield V-JEPA training samples.
+
+    ``data_root`` and ``data_meta`` are mappings ``{internal: <path>, msk: <path or None>}``: the MSK data is
+    used iff ``msk`` is set in both. ``msk_subset`` subsamples the MSK part only (see ``UnlabeledDataset``).
 
     Item shape mirrors ``VideoDataset``: ``([tensor (1, D, H, W)], 0, [arange(D)])``
     (``D`` = depth, i.e. the number of slices -- treated as video frames here).
@@ -41,15 +45,17 @@ class MIDataset(torch.utils.data.Dataset):
         resample_mode="nearest",
         min_series_len=2,
         max_series_len=None,
+        msk_subset=1.0,
     ):
         check_series_depth(series_depth)
-        self._core = UnlabeledKneeMRIDataset(
+        self._core = UnlabeledDataset(
             data_root=data_root,
             data_meta=data_meta,
             series_depth=series_depth,
             resample_mode=resample_mode,
             min_series_len=min_series_len,
             max_series_len=max_series_len,
+            msk_subset=msk_subset,
         )
         self.transform = transform
 
@@ -100,6 +106,7 @@ def make_MIDataset(
     log_dir=None,
     min_series_len=2,
     max_series_len=None,
+    msk_subset=1.0,
 ):
     dataset = MIDataset(
         data_root=data_root,
@@ -109,6 +116,7 @@ def make_MIDataset(
         resample_mode=resample_mode,
         min_series_len=min_series_len,
         max_series_len=max_series_len,
+        msk_subset=msk_subset,
     )
 
     dist_sampler = torch.utils.data.distributed.DistributedSampler(

@@ -223,9 +223,12 @@ def main(args, resume_preempt=False):
     datasets_weights = cfgs_data.get("datasets_weights")
     persistent_workers = cfgs_data.get("persistent_workers", False)
     is_mi_dataset = dataset_type.lower() == "midataset"
-    # -- MI (medical imaging) dataset: folders of JPEG slices loaded as 3D volumes
+    # -- MI (medical imaging) dataset: kneeno.UnlabeledDataset, the internal knee data (JPEG slices) plus,
+    # optionally, the MSK data (npz volumes). Both are mappings {internal: <path>, msk: <path or null>}.
     mi_data_root = cfgs_data.get("data_root")
     mi_data_meta = cfgs_data.get("data_meta")
+    # subsample of the MSK part only (1.0 = all of it); sets the MSK share of the samples
+    msk_subset = cfgs_data.get("msk_subset", 1.0)
     # every volume is resampled to this many slices (required, > 0, for MI data)
     series_depth = cfgs_data.get("series_depth")
     # depth-resampling method: "nearest" or "interpolate"
@@ -546,6 +549,7 @@ def main(args, resume_preempt=False):
         data_meta=mi_data_meta,
         series_depth=series_depth,
         resample_mode=resample_mode,
+        msk_subset=msk_subset,
         log_dir=None,
     )
     try:

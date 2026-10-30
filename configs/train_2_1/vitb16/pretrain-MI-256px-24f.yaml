@@ -6,8 +6,11 @@ mem_per_gpu: 220G
 folder: /hpcwork/va105917/vjepa/pretrain_2_1/${SLURM_JOB_ID}.16p.24d.vitb.256px
 data:
   dataset_type: MIDataset
-  data_root: /dev/shm/kneeno_data/internal
-  data_meta: /hpcwork/p0021834/workspace_roman/jonas/metadata/internal_unlabeled.json
+  # kneeno.UnlabeledDataset: the internal knee data, plus the MSK data iff msk is set in both (extracted by KneeNo's
+  # prepare_data.py --msk-tar-dir; metadata from data/msk/preprocess_msk.py).
+  data_root: {internal: /dev/shm/kneeno_data/internal, msk: null}
+  data_meta: {internal: /hpcwork/p0021834/workspace_roman/jonas/metadata/internal_unlabeled.json, msk: null}
+  msk_subset: 1.0  # subsample of the MSK part only (1.0 = all of it)
   series_depth: 24
   resample_mode: nearest  # only used when series_depth > 0: "nearest" or "interpolate"
   batch_size: 48

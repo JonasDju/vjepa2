@@ -5,9 +5,9 @@
 
 """Parity + integration checks for the KneeNo-backed MIDataset wrapper.
 
-The raw volume loading now lives in ``kneeno``; this verifies the V-JEPA wrapper
-reproduces the old ``(buffer, label, clip_indices)`` sample and still flows
-through ``MaskCollator``.
+The raw volume loading now lives in ``kneeno`` (``UnlabeledDataset``: the internal knee data plus, optionally,
+the MSK data); this verifies the V-JEPA wrapper reproduces the old ``(buffer, label, clip_indices)`` sample and
+still flows through ``MaskCollator``.
 """
 
 import json
@@ -19,7 +19,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from kneeno import UnlabeledKneeMRIDataset
+from kneeno import UnlabeledKneeMRIDataset, UnlabeledMSKDataset
 from src.datasets.mi_dataset import MIDataset, make_MIDataset
 from src.masks.multiseq_multiblock3d import MaskCollator
 
@@ -62,15 +62,39 @@ def make_dataset(root):
     return str(p)
 
 
+MSK_SPEC = {"m0": {"sag_t2": 5, "cor_pd": 7}, "m1": {"tra_t2": 9}}
+
+
+def make_msk_dataset(root):
+    """Write ``root/<case_id>/<series>.npz`` + metadata as KneeNo's ``data/msk/preprocess_msk.py`` does."""
+    rng = np.random.default_rng(1)
+    meta = {}
+    for case_id, series in MSK_SPEC.items():
+        meta[case_id] = {}
+        (Path(root) / case_id).mkdir(parents=True)
+        for name, n in series.items():
+            volume = rng.integers(0, 256, size=(n, H, W), dtype=np.uint8)
+            np.savez_compressed(Path(root) / case_id / f"{name}.npz", volume=volume)
+            meta[case_id][name] = {"dimensions": [H, W, n], "data_resolution": [0.5, 0.5, 3.0], "body_part": "hip"}
+    p = Path(root) / "metadata.json"
+    p.write_text(json.dumps({"unlabeled": meta}))
+    return str(p)
+
+
 class MIDatasetWrapperTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.root = self._tmp.name
-        self.meta = make_dataset(self.root)
+        self.internal_root = str(Path(self._tmp.name) / "internal")
+        self.internal_meta = make_dataset(self.internal_root)
+        self.msk_root = str(Path(self._tmp.name) / "msk")
+        self.msk_meta = make_msk_dataset(self.msk_root)
+        # Knee only, as the shipped configs.
+        self.root = {"internal": self.internal_root, "msk": None}
+        self.meta = {"internal": self.internal_meta, "msk": None}
 
     def test_sample_matches_raw_loader(self):
-        core = UnlabeledKneeMRIDataset(self.root, self.meta, series_depth=DEPTH)
+        core = UnlabeledKneeMRIDataset(self.internal_root, self.internal_meta, series_depth=DEPTH)
         wrapped = MIDataset(self.root, self.meta, series_depth=DEPTH, transform=None)
 
         self.assertEqual(len(wrapped), len(core))
@@ -87,7 +111,7 @@ class MIDatasetWrapperTest(unittest.TestCase):
             )
 
     def test_transform_is_applied_to_raw_volume(self):
-        core = UnlabeledKneeMRIDataset(self.root, self.meta, series_depth=DEPTH)
+        core = UnlabeledKneeMRIDataset(self.internal_root, self.internal_meta, series_depth=DEPTH)
         calls = []
 
         def fake_transform(vol):
@@ -104,6 +128,33 @@ class MIDatasetWrapperTest(unittest.TestCase):
             )
         )
 
+    def test_msk_volumes_follow_the_knee_volumes(self):
+        wrapped = MIDataset(
+            {"internal": self.internal_root, "msk": self.msk_root},
+            {"internal": self.internal_meta, "msk": self.msk_meta},
+            series_depth=DEPTH,
+        )
+        msk = UnlabeledMSKDataset(self.msk_root, self.msk_meta, series_depth=DEPTH)
+        self.assertEqual(len(wrapped), 5 + len(msk))
+        for j in range(len(msk)):
+            buffer, label, clip_indices = wrapped[5 + j]
+            self.assertTrue(np.array_equal(buffer[0], _channel_last(msk[j])))
+            self.assertEqual(buffer[0].dtype, np.uint8)
+            self.assertTrue(np.array_equal(clip_indices[0], np.arange(DEPTH)))
+
+    def test_msk_subset_shrinks_only_the_msk_part(self):
+        wrapped = MIDataset(
+            {"internal": self.internal_root, "msk": self.msk_root},
+            {"internal": self.internal_meta, "msk": self.msk_meta},
+            series_depth=DEPTH,
+            msk_subset=2,
+        )
+        self.assertEqual(len(wrapped), 5 + 2)
+
+    def test_a_single_path_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "mapping"):
+            MIDataset(self.internal_root, self.internal_meta, series_depth=DEPTH)
+
     def test_flows_through_mask_collator(self):
         collator = MaskCollator(
             cfgs_mask=MASK_CFGS,
@@ -113,8 +164,8 @@ class MIDatasetWrapperTest(unittest.TestCase):
             tubelet_size=2,
         )
         _, loader, sampler = make_MIDataset(
-            data_root=self.root,
-            data_meta=self.meta,
+            data_root={"internal": self.internal_root, "msk": self.msk_root},
+            data_meta={"internal": self.internal_meta, "msk": self.msk_meta},
             batch_size=2,
             series_depth=DEPTH,  # the fixture's native depths are 4, 6 and 8
             transform=None,
@@ -126,6 +177,7 @@ class MIDatasetWrapperTest(unittest.TestCase):
         sampler.set_epoch(0)
 
         batches = list(loader)
+        self.assertEqual(len(batches), (5 + 3) // 2)  # the knee and the MSK series
         self.assertTrue(batches, "sampler produced no batches")
         for fpc_collations in batches:
             self.assertEqual(len(fpc_collations), 1)  # one fpc: every volume has DEPTH slices

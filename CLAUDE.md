@@ -96,16 +96,24 @@ treated as a video (slices = frames), one training item per series.
 **Where the code lives:** the model-agnostic core (metadata parsing, series
 enumeration, volume loading, depth resampling) lives in the `kneeno` package
 (`KneeNo/kneeno/`) so the DINOv2 side can reuse it. `src/datasets/mi_dataset.py` only
-wraps `kneeno.UnlabeledKneeMRIDataset` to add the V-JEPA sample format and transform, and
-keeps `make_MIDataset` plus `check_series_depth`. KneeNo's depth-bucket sampler,
+wraps `kneeno.UnlabeledDataset` (since 2026-10-30; the internal knee data plus, optionally, the musculoskeletal
+(MSK) data) to add the V-JEPA sample format and transform, and keeps `make_MIDataset` plus `check_series_depth`. KneeNo's depth-bucket sampler,
 `effective_depth` and `get_series_depths` were removed (2026-09-28) together with this repo's
 native-depth mode.
 
-**Data layout**
+**Data layout.** `data.data_root` and `data.data_meta` are mappings `{internal: <path>, msk: <path or null>}`
+(`kneeno.UnlabeledDataset`; a single path raises with a migration hint). The MSK data is used iff `msk` is set in
+both; the shipped configs set it `null`.
 ```
-data_root/<case_id>/<series_name>/<NNN>.jpeg      # NNN = 000 .. n_images-1
-data_meta  -> metadata.json: { split: { case_id: { series_name: {"dimensions": [H, W, n_images], ...} } } }
+data_root.internal/<case_id>/<series_name>/<NNN>.jpeg   # NNN = 000 .. n_images-1
+data_root.msk/<case_id>/<series_name>.npz               # (D, H, W) uint8, KneeNo's data/msk/preprocess_msk.py
+data_meta.*  -> metadata.json: { split: { case_id: { series_name: {"dimensions": [H, W, n_images], ...} } } }
 ```
+`data.msk_subset` (default `1.0`) subsamples the MSK part only. Compute is fixed by `ipe`, so the full MSK data
+(about 2/3 of the samples) means each knee series is seen about a third as often. KneeNo raises if an MSK case id is
+in the internal metadata (any split), or if a `data_root` folder is missing. This repo has no pretraining submit
+script: whatever launches the run must extract the MSK tars first (`prepare_data.py --msk-tar-dir`, to
+`/dev/shm/kneeno_data/msk`).
 `split` is a global split (KneeNo `data/internal/extract_unlabeled_meta.py`); pretraining reads only `train` and
 `unlabeled` (`kneeno.dataset.PRETRAINING_SPLITS`), never `val`, the evaluation's `internal` test set. A metadata
 file without the split level raises.
@@ -114,15 +122,16 @@ whatever keys exist. `metadata.json` at the repo root is a ~19 MB reference samp
 (untracked, keep it that way): **only ever read a few lines of it**.
 
 **Key files**
-- `KneeNo/kneeno/dataset.py` — `KneeNoDataset` (base), `UnlabeledKneeMRIDataset` (returns a
-  bare channel-first `(1,D,H,W)` tensor), `load_metadata()`.
+- `KneeNo/kneeno/dataset.py` — `KneeNoDataset` (base), `UnlabeledDataset` (what `MIDataset` builds:
+  `UnlabeledKneeMRIDataset` + optional `UnlabeledMSKDataset`; returns a bare channel-first `(1,D,H,W)` tensor),
+  `load_metadata()`.
 - `src/datasets/mi_dataset.py` — `MIDataset` (wrapper), `make_MIDataset`. Item shape:
   `([tensor (1,D,H,W)], 0, [arange(D)])` (`D` = depth = slice count, treated as
   video frames). True 1-channel (`in_chans=1`); kneeno returns `(1,D,H,W)` and
   `MIDataset` flips it back to channel-last `(D,H,W,1)` for the shared
   `VideoTransform`. Plain `DistributedSampler`.
 - `src/datasets/data_manager.py` — `init_data()` gets a `midataset` branch and the
-  `data_root` / `data_meta` / `series_depth` / `resample_mode` kwargs.
+  `data_root` / `data_meta` / `series_depth` / `resample_mode` / `msk_subset` kwargs.
 - `app/vjepa_2_1/train.py` — all MI wiring guarded by `is_mi_dataset`: `dataset_fpcs =
   [series_depth]`, `in_chans=1`, `normalize=((0.5,),(0.5,))`,
   `meta.enc_static_graph` flag on the encoder DDP wrap. Also fixed a pre-existing bug

@@ -19,7 +19,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from kneeno import UnlabeledKneeMRIDataset, UnlabeledMSKDataset
+from kneeno import UnlabeledKneeMRIDataset
 from src.datasets.mi_dataset import MIDataset, make_MIDataset
 from src.masks.multiseq_multiblock3d import MaskCollator
 
@@ -45,10 +45,10 @@ def _channel_last(t):
     return np.moveaxis(arr, 0, -1)
 
 
-def make_dataset(root):
-    rng = np.random.default_rng(0)
+def make_dataset(root, spec=SPEC, split="train", seed=0):
+    rng = np.random.default_rng(seed)
     meta = {}
-    for case_id, series in SPEC.items():
+    for case_id, series in spec.items():
         meta[case_id] = {}
         for name, n in series.items():
             d = Path(root) / case_id / name
@@ -58,7 +58,7 @@ def make_dataset(root):
                 Image.fromarray(arr, mode="L").save(d / f"{i:03d}.jpeg")
             meta[case_id][name] = {"dimensions": [H, W, n]}
     p = Path(root) / "metadata.json"
-    p.write_text(json.dumps({"train": meta}))  # KneeNo pretrains on the global splits "train" + "unlabeled"
+    p.write_text(json.dumps({split: meta}))  # KneeNo pretrains on the global splits "train" + "unlabeled"
     return str(p)
 
 
@@ -66,19 +66,8 @@ MSK_SPEC = {"m0": {"sag_t2": 5, "cor_pd": 7}, "m1": {"tra_t2": 9}}
 
 
 def make_msk_dataset(root):
-    """Write ``root/<case_id>/<series>.npz`` + metadata as KneeNo's ``data/msk/preprocess_msk.py`` does."""
-    rng = np.random.default_rng(1)
-    meta = {}
-    for case_id, series in MSK_SPEC.items():
-        meta[case_id] = {}
-        (Path(root) / case_id).mkdir(parents=True)
-        for name, n in series.items():
-            volume = rng.integers(0, 256, size=(n, H, W), dtype=np.uint8)
-            np.savez_compressed(Path(root) / case_id / f"{name}.npz", volume=volume)
-            meta[case_id][name] = {"dimensions": [H, W, n], "data_resolution": [0.5, 0.5, 3.0], "body_part": "hip"}
-    p = Path(root) / "metadata.json"
-    p.write_text(json.dumps({"unlabeled": meta}))
-    return str(p)
+    """MSK data as KneeNo's ``data/msk/preprocess_msk.py`` writes it: the knee layout, every case ``unlabeled``."""
+    return make_dataset(root, MSK_SPEC, split="unlabeled", seed=1)
 
 
 class MIDatasetWrapperTest(unittest.TestCase):
@@ -134,7 +123,7 @@ class MIDatasetWrapperTest(unittest.TestCase):
             {"internal": self.internal_meta, "msk": self.msk_meta},
             series_depth=DEPTH,
         )
-        msk = UnlabeledMSKDataset(self.msk_root, self.msk_meta, series_depth=DEPTH)
+        msk = UnlabeledKneeMRIDataset(self.msk_root, self.msk_meta, series_depth=DEPTH)
         self.assertEqual(len(wrapped), 5 + len(msk))
         for j in range(len(msk)):
             buffer, label, clip_indices = wrapped[5 + j]

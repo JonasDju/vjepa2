@@ -15,6 +15,7 @@ import submitit
 import yaml
 from kneeno.config import expand_env_vars
 
+from app.pretrain_job_id import resolve_pretrain_job_id
 from app.scaffold import main as app_main
 from src.utils.logging import get_logger, git_information
 
@@ -74,6 +75,8 @@ class Trainer:
 
     def __call__(self):
         app = self.app
+        # ${PRETRAIN_JOB_ID}: given at submission (then already expanded on the login node), else this job's ID.
+        resolve_pretrain_job_id(self.args_pretrain)
         # Expand $VAR / ~ in the config now (runs on the compute node, so job-local
         # vars such as $TMPDIR resolve to the right value).
         params = expand_env_vars(self.args_pretrain)

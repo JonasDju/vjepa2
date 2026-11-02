@@ -26,6 +26,7 @@ from pathlib import Path
 import yaml
 from kneeno.config import expand_env_vars
 
+from app.pretrain_job_id import resolve_pretrain_job_id
 from app.scaffold import main as app_main
 from src.utils.distributed import init_distributed
 from src.utils.logging import git_information
@@ -121,6 +122,9 @@ def process_main(rank, fname, world_size, devices):
 
 if __name__ == "__main__":
     args = parser.parse_args()
+    # ${PRETRAIN_JOB_ID} in the config's paths: set here, before the ranks are spawned (they inherit the environment)
+    with open(args.fname, "r") as y_file:
+        resolve_pretrain_job_id(yaml.load(y_file, Loader=yaml.FullLoader))
     if args.debugmode:
         process_main(rank=0, fname=args.fname, world_size=1, devices=["cuda:0"])
     else:

@@ -3,7 +3,9 @@ nodes: 16
 tasks_per_node: 8
 cpus_per_task: 16
 mem_per_gpu: 220G
-folder: /hpcwork/va105917/vjepa/cooldown_2_1/${SLURM_JOB_ID}.16p.24d.vitb.384px
+# ${PRETRAIN_JOB_ID}: this job's SLURM ID, or the first job's to resume its run (sbatch --export=ALL,PRETRAIN_JOB_ID=<id>);
+# set by app/main.py, see app/pretrain_job_id.py
+folder: /hpcwork/va105917/vjepa/cooldown_2_1/${PRETRAIN_JOB_ID}.16p.24d.vitb.384px
 data:
   dataset_type: MIDataset
   # kneeno.UnlabeledDataset: the internal knee data, plus the MSK data iff msk is set in both (extracted by KneeNo's
@@ -156,8 +158,8 @@ eval:
     multiprocessing_context: fork  # eval DataLoader worker start method; null -> inherit. Workers must never touch CUDA
     persistent_workers: true  # keep workers alive across head epochs (ignored when num_workers = 0)
   logging:
-    tensorboard_dir: /hpcwork/va105917/vjepa/cooldown_2_1/${SLURM_JOB_ID}.16p.24d.vitb.384px/eval/in-training/tb
-    per_label_dir: /hpcwork/va105917/vjepa/cooldown_2_1/${SLURM_JOB_ID}.16p.24d.vitb.384px/eval/in-training/eval_per_label
+    tensorboard_dir: /hpcwork/va105917/vjepa/cooldown_2_1/${PRETRAIN_JOB_ID}.16p.24d.vitb.384px/eval/in-training/tb
+    per_label_dir: /hpcwork/va105917/vjepa/cooldown_2_1/${PRETRAIN_JOB_ID}.16p.24d.vitb.384px/eval/in-training/eval_per_label
     tag_prefix: eval
   freq:
     knn: 5

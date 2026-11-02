@@ -40,6 +40,17 @@ Local / single GPU (also inside an sbatch script):
   to 0, so `cuda:0` is correct regardless of the physical index.
 - `nodes` / `tasks_per_node` in the YAML are **only** read by `app/main_distributed.py`
   (the `submitit` launcher run from a login node), not by `app/main.py`.
+- **Run ID: `PRETRAIN_JOB_ID`** (since 2026-11-02). The MI configs' `folder` and `eval.logging` dirs are named after
+  `${PRETRAIN_JOB_ID}` (`${SLURM_JOB_ID}` before, so resuming meant editing the config). `app/pretrain_job_id.py`
+  sets it before the config is expanded: in `app/main.py` before the ranks are spawned, in `app/main_distributed.py`
+  in `Trainer.__call__` on the node.
+  - Unset: this job's `SLURM_JOB_ID`, a new run (a re-queued job keeps its ID and continues its own run).
+  - Set (`sbatch --export=ALL,PRETRAIN_JOB_ID=<first job's id> ...`; RWTH's sbatch drops a `VAR=... sbatch` prefix):
+    resumes that run through `train.py`'s own resume (`meta.load_checkpoint: true`, or `optimization.resume_anneal:
+    true` for a cooldown). Inside a SLURM job `<folder>/latest.pth.tar` must then exist, or it raises before
+    spawning, so a mistyped ID can't start a new run. Outside SLURM it must be set, and may name a new run.
+  - The cooldown config uses the same variable for its own folder; its `anneal_ckpt` is still a `<MODEL_DIR>` literal.
+  - Tests: `tests/vjepa_2_1/test_pretrain_job_id.py`.
 - The progress line (every `log_freq` = 10 iterations) includes `[grad: …]`: the global L2
   norm of the encoder + predictor gradients of that iteration, after the DDP all-reduce and
   before the optimizer step and before any clipping (so it is the pre-clip norm); `nan` when

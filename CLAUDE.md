@@ -106,7 +106,7 @@ native-depth mode.
 both; the shipped configs set it `null`.
 ```
 data_root.internal/<case_id>/<series_name>/<NNN>.jpeg   # NNN = 000 .. n_images-1
-data_root.msk/<case_id>/<series_name>.npz               # (D, H, W) uint8, KneeNo's data/msk/preprocess_msk.py
+data_root.msk/<case_id>/<series_name>/<NNN>.jpeg        # the same layout, KneeNo's data/msk/preprocess_msk.py
 data_meta.*  -> metadata.json: { split: { case_id: { series_name: {"dimensions": [H, W, n_images], ...} } } }
 ```
 `data.msk_subset` (default `1.0`) subsamples the MSK part only. Compute is fixed by `ipe`, so the full MSK data
@@ -123,7 +123,8 @@ whatever keys exist. `metadata.json` at the repo root is a ~19 MB reference samp
 
 **Key files**
 - `KneeNo/kneeno/dataset.py` — `KneeNoDataset` (base), `UnlabeledDataset` (what `MIDataset` builds:
-  `UnlabeledKneeMRIDataset` + optional `UnlabeledMSKDataset`; returns a bare channel-first `(1,D,H,W)` tensor),
+  two `UnlabeledKneeMRIDataset`s, the internal one + an optional MSK one; returns a bare channel-first `(1,D,H,W)`
+  tensor),
   `load_metadata()`.
 - `src/datasets/mi_dataset.py` — `MIDataset` (wrapper), `make_MIDataset`. Item shape:
   `([tensor (1,D,H,W)], 0, [arange(D)])` (`D` = depth = slice count, treated as

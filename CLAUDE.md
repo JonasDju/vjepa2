@@ -25,6 +25,21 @@ V-JEPA 2-AC, V-JEPA 2.1 and all evals is otherwise unchanged.
 
 ## Running training
 
+On the cluster: `sbatch app/vjepa_2_1/submit_pretrain.sh` (since 2026-11-02; resume a run with
+`sbatch --export=ALL,PRETRAIN_JOB_ID=<first job's id> ...`, see below).
+- One node, one task, `--gres=gpu:4`, 128 CPUs, 24 h. It refuses more nodes or tasks: `app.main` starts the per-GPU
+  processes itself. `--devices` is one `cuda:<id>` per entry of `CUDA_VISIBLE_DEVICES`.
+- `#SBATCH --beeond`: the data goes to `$BEEOND/kneeno_data` (`prepare_data.py --internal-tar-dir`, plus
+  `--msk-tar-dir` iff `MSK_TAR_DIR` is set). BeeOND is a temporary BeeGFS over the SSDs of all the job's nodes (one
+  namespace, not per node), makes the job exclusive and is deleted when the job ends. The MI configs' `data_root`
+  (pretraining and in-training eval) point there; `$BEEOND` unset leaves the literal path, and KneeNo raises.
+- Env vars through `--export=ALL,...`: `PRETRAIN_JOB_ID`, `CONFIG` (default the 256px pretrain config), `REPO_DIR`,
+  `KNEENO_DIR`, `MSK_TAR_DIR`. Config, KneeNo, `$BEEOND`, node/task count and GPUs are checked before extracting.
+- Log: `slurm_logs/pretrain.<job id>.log`, starting with the vjepa2 and KneeNo commits (`git describe --dirty`).
+- No cleanup step: BeeOND deletes the data at job end, and an `rm -rf` of millions of files would only cost node
+  time. `tests/vjepa_2_1/test_submit_pretrain.py` runs it with `srun`, `rm` and the venv's python stubbed (and checks
+  that it calls no `rm`).
+
 Local / single GPU (also inside an sbatch script):
 ```bash
 .venv/bin/python -m app.main \
@@ -122,9 +137,9 @@ data_meta.*  -> metadata.json: { split: { case_id: { series_name: {"dimensions":
 ```
 `data.msk_subset` (default `1.0`) subsamples the MSK part only. Compute is fixed by `ipe`, so the full MSK data
 (about 2/3 of the samples) means each knee series is seen about a third as often. KneeNo raises if an MSK case id is
-in the internal metadata (any split), or if a `data_root` folder is missing. This repo has no pretraining submit
-script: whatever launches the run must extract the MSK tars first (`prepare_data.py --msk-tar-dir`, to
-`/dev/shm/kneeno_data/msk`).
+in the internal metadata (any split), or if a `data_root` folder is missing. `app/vjepa_2_1/submit_pretrain.sh`
+extracts the MSK tars to `$BEEOND/kneeno_data/msk` iff `MSK_TAR_DIR` is set; set `data_root.msk` / `data_meta.msk`
+to match.
 `split` is a global split (KneeNo `data/internal/extract_unlabeled_meta.py`); pretraining reads only `train` and
 `unlabeled` (`kneeno.dataset.PRETRAINING_SPLITS`), never `val`, the evaluation's `internal` test set. A metadata
 file without the split level raises.
@@ -271,7 +286,7 @@ epoch, no feature cache) sets `early_stop_patience: 5`.
   `compile_attentive_heads` (`true` in the standalone eval config, `false` in the pretraining configs).
 - The standalone eval config sweeps `linear_pool.lr` (`[0.0001, ..., 0.02]`, 8 values) and `knn.temperature`
   (`[0.01, ..., 1.0]`, 8 values). The pretraining configs keep a single value each.
-- Its `attentive_pool` trains with `lr: 0.0005`, batch 64 as 4 micro-batches of 16, `max_epochs: 15`,
+- Its `attentive_pool` trains with `lr: 0.00025`, `weight_decay: 0.1`, batch 64 as 4 micro-batches of 16, `max_epochs: 15`,
   `warmup_epochs: 3`.
 
 Old keys (`epochs`, `split.train_fraction` / `test_fraction` / `val_fraction`, `data.subset`, `data.dataset_type`,

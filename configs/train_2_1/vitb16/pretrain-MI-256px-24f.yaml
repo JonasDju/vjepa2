@@ -10,7 +10,7 @@ data:
   dataset_type: MIDataset
   # kneeno.UnlabeledDataset: the internal knee data, plus the MSK data iff msk is set in both (extracted by KneeNo's
   # prepare_data.py --msk-tar-dir; metadata from data/msk/preprocess_msk.py).
-  data_root: {internal: /dev/shm/kneeno_data/internal, msk: null}
+  data_root: {internal: $BEEOND/kneeno_data/internal, msk: null}
   data_meta: {internal: /hpcwork/p0021834/workspace_roman/jonas/metadata/internal_unlabeled.json, msk: null}
   msk_subset: 1.0  # subsample of the MSK part only (1.0 = all of it)
   series_depth: 24
@@ -164,7 +164,7 @@ eval:
   verbose: true  # log each task's start and every head epoch's val metrics
   data:
     # internal: global "train" (the heads' train/val) + "val" (the "internal" test set, never pretrained on)
-    data_root: {internal: /dev/shm/kneeno_data/internal}
+    data_root: {internal: $BEEOND/kneeno_data/internal}
     label_meta: {internal: /hpcwork/p0021834/workspace_roman/jonas/metadata/internal_labeled.json}
     test_sets: [internal]  # in-training: never external (that is for the final numbers, not for picking checkpoints)
     series_depth: 24  # match the series_depth above -- no resampling distribution shift

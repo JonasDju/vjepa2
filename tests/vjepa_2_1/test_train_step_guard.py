@@ -5,9 +5,10 @@
 
 """Non-finite-gradient guard for ``app/vjepa_2_1/train.py``.
 
-The guard lives inline in the (deeply nested) ``train_step`` closure, so it cannot be
-imported. We test the one extractable piece (``compute_grad_norm``'s non-finite
-detection) and a faithful inline replica of the guard block: on a non-finite gradient
+The training loop lives inline in ``main``, so it cannot be imported, but its
+once-per-optimizer-step part is: ``optimizer_step`` (norm probe, guard, clip,
+step, ``zero_grad``) and ``ema_update``. We test ``compute_grad_norm``'s non-finite detection
+and the step region built from those two helpers: on a non-finite gradient
 the optimizer step and the target-EMA update are both skipped, ``optimizer.zero_grad()``
 still runs, and the EMA momentum schedule still advances. A separate replica covers the
 consecutive-skip counter that aborts the run after ``MAX_CONSECUTIVE_NONFINITE`` skips
@@ -32,6 +33,8 @@ from app.vjepa_2_1.train import (
     check_optimization_config,
     clip_gradients,
     compute_grad_norm,
+    ema_update,
+    optimizer_step,
     qk_temperature_summary,
 )
 from app.vjepa_2_1.utils import apply_optimizer_hparams
@@ -42,18 +45,13 @@ def _ema_schedule(m=0.99, n=1000):
 
 
 def _apply_guarded_step(online, target, optimizer, momentum_scheduler, poison=None, max_norm=None):
-    """Replica of the train.py step region: backward, grad-norm probe, guard, clip, EMA.
+    """The train.py step region: backward, then the real ``optimizer_step`` and ``ema_update``.
 
-    Mirrors ``train.py``:
-        loss.backward()
-        grad_norm = compute_grad_norm(enc_params + pred_params)
-        grads_finite = bool(np.isfinite(grad_norm))
-        if grads_finite:
-            clip_gradients(enc_params + pred_params, gradient_clipping, grad_norm)
-            optimizer.step()
-        optimizer.zero_grad()
-        m = next(momentum_scheduler)            # advances every iter
-        if run_step and grads_finite: <EMA update>
+    Mirrors ``train.py``'s ``finish_step`` (run_step=True, no GradScaler):
+        loss.backward()                       # (the last micro-step's)
+        grads_finite, clipped, grad_norm = optimizer_step(optimizer, scaler, enc + pred params, clipping)
+        m = next(momentum_scheduler)          # advances every step
+        if run_step and grads_finite: ema_update(encoder, target_encoder, m)
 
     Returns ``(grads_finite, step_applied, grad_norm)``.
     """
@@ -64,20 +62,12 @@ def _apply_guarded_step(online, target, optimizer, momentum_scheduler, poison=No
     if poison is not None:
         dict(online.named_parameters())[poison].grad[0] = float("inf")
 
-    grad_norm = compute_grad_norm(list(online.parameters()))
-    grads_finite = bool(np.isfinite(grad_norm))
-
-    if grads_finite:
-        clip_gradients(list(online.parameters()), max_norm, grad_norm)
-        optimizer.step()
-    optimizer.zero_grad()
+    grads_finite, _, grad_norm = optimizer_step(optimizer, None, list(online.parameters()), max_norm)
 
     m = next(momentum_scheduler)  # advance every iter, aligned to the step count
     step_applied = grads_finite
     if step_applied:
-        with torch.no_grad():
-            for p_q, p_k in zip(online.parameters(), target.parameters()):
-                p_k.mul_(m).add_(p_q, alpha=1 - m)
+        ema_update(online, target, m)
     return grads_finite, step_applied, grad_norm
 
 

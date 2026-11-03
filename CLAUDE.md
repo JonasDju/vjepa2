@@ -101,6 +101,45 @@ a config with `qk_norm: none` (the default, and the upstream configs) must set `
 - Tests: `tests/vjepa_2_1/test_qk_norm.py` (model side, checkpoint guard),
   `tests/vjepa_2_1/test_train_step_guard.py` (clipping, validation, betas on resume).
 
+## Gradient accumulation (`optimization.grad_accum_steps`, added 2026-11-03)
+
+Upstream ViT-B trains at a global batch of 3072 (64 GPUs × 48). With `grad_accum_steps: K`, one optimizer step
+consumes K batches per rank, so global batch = `batch_size × world_size × K` (16 on 4 GPUs = 3072). It is logged at
+startup and saved in the checkpoint (`grad_accum_steps`, `global_batch_size`).
+- **The shipped MI configs use K=16 with upstream's LR schedule** (since 2026-11-03).
+  - Pretraining: 48 × 4 × 16 = 3072, warmup over 40 epochs from 1e-4 to 6e-4, then constant
+    (`vitb16/pretrain-256px-16f.yaml`). It was 1.5e-4 with warmup 10 at batch 192.
+  - Cooldown: K=32, 24 × 4 × 32 = 3072, upstream's cooldown batch (16 nodes × 8 GPUs × 24; every upstream cooldown
+    keeps 3072), with a linear decay from 6e-4 to 1e-6 (`vitb16/cooldown-256px-64f.yaml`).
+  - Kept from before: `epochs: 300` (upstream 1000), `lambda_warmup_*_iter` 7500/15000 (upstream defaults
+    15000/30000), `betas: [0.9, 0.95]` and `gradient_clipping: 1.0`.
+- **Exact, not approximate.** The model has no batch-dependent layers. Each micro-batch's loss is divided by K, and
+  all micro-batches have the same size (`drop_last`), so the accumulated gradient is the global-batch mean loss's.
+  `MaskCollator` truncates per collated batch: K micro-batches on 4 ranks are exactly 4K ranks.
+- **Everything schedule-like counts optimizer steps**: `itr`/`ipe`, `epochs`/`warmup`, the LR/WD schedules, the EMA
+  momentum schedule *and the EMA update itself* (per micro-step it would apply `m^K`), `lambda_warmup_*_iter`,
+  grad norm, clipping, the non-finite guard, `GradScaler.update`, the csv row and the progress line (`[accum: K]`).
+  Times are summed over the micro-steps; the loss is their mean.
+  - `ipe: null` → `len(loader) // K`.
+  - On resume, the mask collator's counter (it counts collated batches) advances `start_epoch × ipe × K`.
+  - Resuming with a different K only warns.
+  - `skip_batches` counts batches.
+- **Compute:** with `ipe` fixed, an epoch costs K× the data and wall time (K=16: ~16 × 0.71 s ≈ 11 s per step, ~1 h
+  per 300-step epoch on 4 GPUs).
+- **DDP.** Micro-steps `0..K-2` run forward + backward under `no_sync()` (`grad_sync`). The last one all-reduces
+  the summed gradient.
+  - **Exception:** every micro-step of the process's first optimizer step syncs (`micro_step_syncs`). The encoder's
+    DDP is `static_graph=True`, and `no_sync` on its first backward fails with `expect_autograd_hooks_ INTERNAL
+    ASSERT` (torch 2.13). Syncing every micro-step is still exact (the all-reduce is linear).
+- **Code:** module-level helpers in `train.py`.
+  - `optimizer_step` (unscale, norm probe, guard, clip, step, `zero_grad`) and `ema_update`, both once per step.
+  - `grad_sync` and `micro_step_syncs`, per micro-step; `check_grad_accum_steps`.
+  - The loop's `micro_step` (forward, `(loss / K).backward()`) and `finish_step`.
+- **Tests:** `tests/vjepa_2_1/test_grad_accum.py`.
+  - 2 gloo ranks × K micro-batches equal one process on the global batch (gradients, grad norm, clipping, online
+    and EMA weights), with a static-graph encoder and a `find_unused_parameters` predictor.
+  - The static-graph trap itself; the EMA once per step; the fp16 `GradScaler` path.
+
 ## Mask truncation (`mask[*].random_truncation`, added 2026-09-29)
 
 `_MaskGenerator.__call__` (`src/masks/multiseq_multiblock3d.py`) cuts every sample's context and target

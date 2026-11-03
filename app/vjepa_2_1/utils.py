@@ -146,9 +146,18 @@ def load_checkpoint(
     opt,
     scaler,
     is_anneal=False,
+    grad_accum_steps=None,
 ):
     logger.info(f"Loading {r_path}")
     checkpoint = robust_checkpoint_loader(r_path, map_location=torch.device("cpu"))
+    if grad_accum_steps is not None:
+        # checkpoints from before gradient accumulation have no key: they ran with 1
+        ckpt_accum = checkpoint.get("grad_accum_steps", 1)
+        if ckpt_accum != grad_accum_steps:
+            logger.warning(
+                f"checkpoint was trained with grad_accum_steps={ckpt_accum}, this run uses {grad_accum_steps}: "
+                "the schedules continue in optimizer steps, but the global batch size changes"
+            )
 
     epoch = 0
     if not is_anneal:

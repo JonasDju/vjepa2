@@ -12,7 +12,9 @@ try:
 except Exception:
     pass
 
+import contextlib
 import copy
+import functools
 import gc
 import logging
 import random
@@ -83,6 +85,83 @@ def clip_gradients(parameters, max_norm, total_norm):
     grads = [p for p in parameters if p.grad is not None]
     torch.nn.utils.clip_grads_with_norm_(grads, max_norm, torch.tensor(total_norm))
     return True
+
+
+def optimizer_step(optimizer, scaler, params, gradient_clipping):
+    """One optimizer step on the gradients accumulated in ``params`` (encoder + predictor).
+
+    ``scaler.unscale_`` (fp16 only), the global grad-norm probe, the non-finite guard (skip the step, but let the
+    scaler back off its scale), clipping, the step and ``optimizer.zero_grad()``. Called once per optimizer step,
+    after the last micro-step's backward, so the norm and the clipping see the gradient of the global-batch loss
+    (after the DDP all-reduce, identical on every rank). Returns ``(grads_finite, clipped, grad_norm)``; the
+    returned ``grad_norm`` is the pre-clip norm.
+    """
+    if scaler is not None:
+        scaler.unscale_(optimizer)
+    grad_norm = compute_grad_norm(params)
+    grads_finite = bool(np.isfinite(grad_norm))
+    clipped = False
+    if grads_finite:
+        clipped = clip_gradients(params, gradient_clipping, grad_norm)
+        if scaler is not None:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+    elif scaler is not None:
+        # let the scaler back off its scale, as scaler.step() would have
+        scaler.update()
+    optimizer.zero_grad()
+    return grads_finite, clipped, grad_norm
+
+
+def ema_update(online, target, m):
+    """In-place EMA of the target encoder: ``target = m * target + (1 - m) * online``.
+
+    Once per optimizer step, never per micro-step: per micro-step it would apply ``m**K`` per step, towards online
+    weights that have not been stepped yet.
+    """
+    with torch.no_grad():
+        params_k = []
+        params_q = []
+        for param_q, param_k in zip(online.parameters(), target.parameters()):
+            params_k.append(param_k)
+            params_q.append(param_q)
+        torch._foreach_mul_(params_k, m)
+        torch._foreach_add_(params_k, params_q, alpha=1 - m)
+
+
+def grad_sync(modules, sync):
+    """Context for one micro-step's forward *and* backward: DDP all-reduce on (``sync``) or deferred.
+
+    With ``sync=False`` every DDP module in ``modules`` runs under ``no_sync()``: the gradients accumulate locally
+    in ``.grad``, and the next synced backward all-reduces their sum. The forward must run inside the context too,
+    or DDP still syncs.
+    """
+    stack = contextlib.ExitStack()
+    if not sync:
+        for module in modules:
+            stack.enter_context(module.no_sync())
+    return stack
+
+
+def micro_step_syncs(micro_itr, grad_accum_steps, first_step):
+    """Whether micro-step ``micro_itr`` (0-based) of an optimizer step all-reduces its gradients.
+
+    The last micro-step always does: it all-reduces the sum of the step's local gradients. Every micro-step of
+    the process's first optimizer step does too (``first_step``). The encoder's DDP has ``static_graph=True``,
+    whose first backward after wrapping records the graph and fails under ``no_sync()``
+    (``expect_autograd_hooks_ INTERNAL ASSERT``, torch 2.13; ``tests/vjepa_2_1/test_grad_accum.py``). Syncing
+    every micro-step is still exact, since the all-reduce is linear: it only costs communication.
+    """
+    return first_step or micro_itr == grad_accum_steps - 1
+
+
+def check_grad_accum_steps(grad_accum_steps):
+    """Validate ``optimization.grad_accum_steps`` (an int >= 1; 1 = no accumulation)."""
+    if isinstance(grad_accum_steps, bool) or not isinstance(grad_accum_steps, int) or grad_accum_steps < 1:
+        raise ValueError(f"optimization.grad_accum_steps must be an integer >= 1, got {grad_accum_steps!r}")
+    return grad_accum_steps
 
 
 def check_optimization_config(gradient_clipping, betas):
@@ -306,6 +385,9 @@ def main(args, resume_preempt=False):
     # max global L2 norm of the encoder + predictor gradients; None disables clipping
     gradient_clipping = cfgs_opt.get("gradient_clipping", None)
     gradient_clipping, betas = check_optimization_config(gradient_clipping, betas)
+    # micro-batches per optimizer step and rank: global batch = batch_size * world_size * grad_accum_steps.
+    # ipe, warmup/epochs and the lambda warmup iterations all count optimizer steps.
+    grad_accum_steps = check_grad_accum_steps(cfgs_opt.get("grad_accum_steps", 1))
     loss_reg_std_mult = cfgs_opt.get("loss_reg_std_mult", None)
     loss_reg_num_tracking_steps = cfgs_opt.get("loss_reg_num_tracking_steps", 300)
     loss_reg_min_epoch = cfgs_opt.get("loss_reg_min_epoch", 50)
@@ -560,8 +642,18 @@ def main(args, resume_preempt=False):
         except Exception:
             _dlen = -1
     if ipe is None:
-        ipe = _dlen
+        # one epoch = about one pass over the data: each optimizer step consumes grad_accum_steps batches
+        ipe = _dlen // grad_accum_steps
+        if ipe < 1:
+            raise ValueError(
+                f"ipe derived from the loader length ({_dlen} batches // grad_accum_steps {grad_accum_steps}) "
+                "is < 1; set optimization.ipe"
+            )
     logger.info(f"Using batch size of {batch_size}, fpcs of {dataset_fpcs}")
+    logger.info(
+        f"grad_accum_steps={grad_accum_steps}: global batch size {batch_size} x {world_size} ranks "
+        f"x {grad_accum_steps} = {batch_size * world_size * grad_accum_steps} per optimizer step"
+    )
     logger.info(f"AdamW betas={betas} eps={eps}, gradient_clipping={gradient_clipping}")
     logger.info(f"iterations per epoch/dataset length: {ipe}/{_dlen}")
 
@@ -628,14 +720,17 @@ def main(args, resume_preempt=False):
             opt=optimizer,
             scaler=scaler,
             is_anneal=is_anneal and not resume_anneal,
+            grad_accum_steps=grad_accum_steps,
         )
         # opt.load_state_dict restored the checkpoint's betas/eps; the config wins
         apply_optimizer_hparams(optimizer, betas, eps)
         if not is_anneal or resume_anneal:
+            # the schedules count optimizer steps, the mask collator's counter collated batches
             for _ in range(start_epoch * ipe):
                 scheduler.step()
                 wd_scheduler.step()
                 next(momentum_scheduler)
+            for _ in range(start_epoch * ipe * grad_accum_steps):
                 mask_collator.step()
 
     def save_checkpoint(epoch, path):
@@ -651,6 +746,8 @@ def main(args, resume_preempt=False):
             "loss": loss_meter.avg,
             "batch_size": batch_size,
             "world_size": world_size,
+            "grad_accum_steps": grad_accum_steps,
+            "global_batch_size": batch_size * world_size * grad_accum_steps,
             "lr": lr,
         }
         try:
@@ -697,8 +794,169 @@ def main(args, resume_preempt=False):
     trailing_losses = []
     step_count = 0
     consecutive_nonfinite = 0  # non-finite-grad guard: skips in a row (across epochs)
+    # this process's first optimizer step syncs every micro-step (see micro_step_syncs)
+    first_step = True
 
-    # -- TRAINING LOOP
+    def next_sample(epoch):
+        """Next batch of the loader; refreshes an exhausted loader, retries on load errors."""
+        nonlocal loader
+        iter_retries = 0
+        while True:
+            try:
+                return next(loader)
+            except StopIteration:
+                logger.info("Exhausted data loaders. Refreshing...")
+                if "airstore" in dataset_type.lower():
+                    unsupervised_sampler.increase_epoch()
+                else:
+                    unsupervised_sampler.set_epoch(epoch)
+                loader = iter(unsupervised_loader)
+            except Exception as e:
+                NUM_RETRIES = 5
+                if iter_retries < NUM_RETRIES:
+                    logger.warning(f"Encountered exception when loading data (num retries {iter_retries}):\n{e}")
+                    iter_retries += 1
+                    time.sleep(5)
+                else:
+                    raise RuntimeError(f"Exceeded max retries ({NUM_RETRIES}) when loading data.") from e
+
+    def load_clips(sample):
+        all_clips, all_masks_enc, all_masks_pred = [], [], []
+        for fpc_sample in sample:
+            udata, masks_enc, masks_pred = fpc_sample
+            all_clips += [udata[0][0].to(device, non_blocking=True)]
+            all_masks_enc += [[m.to(device, non_blocking=True) for m in masks_enc]]
+            all_masks_pred += [[m.to(device, non_blocking=True) for m in masks_pred]]
+        return all_clips, all_masks_enc, all_masks_pred
+
+    def forward_target(c, embed_dim=embed_dim_encoder):
+        with torch.no_grad():
+            h = target_encoder(c, gram_mode=False, training_mode=True)
+            new_h = []
+            for hi in h:
+                if levels_predictor > 1:
+                    hi_0 = F.layer_norm(hi[:, :, :embed_dim], (embed_dim,))
+                    hi_1 = F.layer_norm(
+                        hi[:, :, embed_dim : embed_dim * 2],
+                        (embed_dim,),
+                    )
+                    hi_2 = F.layer_norm(
+                        hi[:, :, embed_dim * 2 : embed_dim * 3],
+                        (embed_dim,),
+                    )
+                    hi_3 = F.layer_norm(hi[:, :, -embed_dim:], (embed_dim,))
+                    hi_norm = torch.cat([hi_0, hi_1, hi_2, hi_3], dim=2)
+                    new_h.append(hi_norm)
+                else:
+                    new_h.append(F.layer_norm(hi, (hi.size(-1),)))
+            return new_h
+
+    def forward_context(clips, masks_enc, masks_pred, embed_dim=embed_dim_encoder):
+        modality = "video"
+        if img_temporal_dim_size is not None:
+            if clips[0].shape[2] == img_temporal_dim_size:
+                modality = "image"
+        z = encoder(clips, masks_enc, gram_mode=False, training_mode=True)
+        z_pred, z_context = predictor(z, masks_enc, masks_pred, mod=modality)
+        if normalize_predictor:
+            z_pred = normalize_nested(z_pred, embed_dim)
+
+            if predict_all:
+                z_context = normalize_nested(z_context, embed_dim)
+        return z_pred, z_context
+
+    def loss_fn(z, h, masks_to_apply, cls_loss, d_weights):
+        if cls_loss:
+            h_cls = [hi[:, 0].unsqueeze(1) for hi in h]
+            h = [apply_masks(hi[:, 1:], mi, concat=False) for hi, mi in zip(h, masks_to_apply)]
+            loss, n = 0, 0
+            for zi, hi, hi_cls in zip(z, h, h_cls):
+                for zij, hij in zip(zi, hi):
+                    h_term = torch.cat([hi_cls, hij], dim=1)
+                    loss += torch.mean(torch.abs(zij - h_term) ** loss_exp) / loss_exp
+                    n += 1
+
+            loss /= n
+            return loss
+        else:
+            h = [apply_masks(hi, mi, concat=False) for hi, mi in zip(h, masks_to_apply)]
+
+            if d_weights is not None:
+                loss, n = 0, 0
+                for zi, hi, d_i in zip(z, h, d_weights):
+                    for zij, hij, d_ij in zip(zi, hi, d_i):
+                        loss_n = torch.abs(zij - hij) ** loss_exp * (1 / d_ij.unsqueeze(2))
+                        loss += torch.mean(loss_n) / loss_exp
+                        n += 1
+                loss /= n
+                return loss
+            else:
+                loss, n = 0, 0
+                for zi, hi in zip(z, h):
+                    for zij, hij in zip(zi, hi):
+                        loss += torch.mean(torch.abs(zij - hij) ** loss_exp) / loss_exp
+                        n += 1
+                loss /= n
+                return loss
+
+    def micro_step(clips, masks_enc, masks_pred, lambda_value_step):
+        """Forward + backward of one micro-batch; the gradients accumulate in ``.grad``.
+
+        The loss is divided by ``grad_accum_steps``: summed over the step's micro-batches (all the same size), the
+        accumulated gradient is that of the mean loss over the global batch, as on ``grad_accum_steps`` times as
+        many ranks. Returns the unscaled losses as floats, so no graph or activation outlives the call.
+        """
+        loss_context = None
+        with torch.amp.autocast(device_type="cuda", dtype=dtype, enabled=mixed_precision):
+            h = forward_target(clips)
+            z_pred, z_context = forward_context(clips, masks_enc, masks_pred)
+            loss = 0
+            loss_pred = loss_fn(z_pred, h, masks_pred, cls_loss=has_cls_first, d_weights=None)
+            loss += loss_pred
+
+            # Context loss
+            if predict_all:
+                distance_weights = compute_mask_distance(masks_pred, masks_enc, grid_size, offset_context_loss)
+                if weight_distance_loss:
+                    d_weights = distance_weights
+                else:
+                    d_weights = None
+                loss_context = loss_fn(z_context, h, masks_enc, cls_loss=False, d_weights=d_weights)
+                loss += loss_context * lambda_value_step
+
+        scaled_loss = loss / grad_accum_steps
+        if scaler is not None:
+            scaler.scale(scaled_loss).backward()
+        else:
+            scaled_loss.backward()
+        return (
+            float(loss),
+            float(loss_pred),
+            float(loss_context) if loss_context is not None else float("nan"),
+        )
+
+    def finish_step(run_step):
+        """The once-per-optimizer-step part: optimizer step (or discard), momentum schedule, EMA."""
+        grads_finite = True
+        clipped = False
+        grad_norm = float("nan")  # stays nan when the loss regulariser skipped the step
+        if run_step:
+            grads_finite, clipped, grad_norm = optimizer_step(
+                optimizer,
+                scaler,
+                list(encoder.parameters()) + list(predictor.parameters()),
+                gradient_clipping,
+            )
+        else:
+            optimizer.zero_grad()
+
+        # momentum update of target encoder; the schedule advances every step, applied or not
+        m = min(next(momentum_scheduler), ema[1])
+        if run_step and grads_finite:
+            ema_update(encoder, target_encoder, m)
+        return grads_finite, clipped, grad_norm
+
+    # -- TRAINING LOOP (one itr = one optimizer step = grad_accum_steps micro-batches per rank)
     for epoch in range(start_epoch, num_epochs):
         logger.info("Epoch %d" % (epoch + 1))
 
@@ -713,257 +971,70 @@ def main(args, resume_preempt=False):
         for itr in range(ipe):
             itr_start_time = time.time()
 
-            iter_retries = 0
-            iter_successful = False
-            while not iter_successful:
-                try:
-                    sample = next(loader)
-                    iter_successful = True
-                except StopIteration:
-                    logger.info("Exhausted data loaders. Refreshing...")
-                    if "airstore" in dataset_type.lower():
-                        unsupervised_sampler.increase_epoch()
-                    else:
-                        unsupervised_sampler.set_epoch(epoch)
-                    loader = iter(unsupervised_loader)
-                except Exception as e:
-                    NUM_RETRIES = 5
-                    if iter_retries < NUM_RETRIES:
-                        logger.warning(
-                            f"Encountered exception when loading data (num retries {iter_retries}):\n{e}"
-                        )
-                        iter_retries += 1
-                        time.sleep(5)
-                    else:
-                        raise RuntimeError(
-                            f"Exceeded max retries ({NUM_RETRIES}) when loading data."
-                        ) from e
-
-            for _fpc_sample in sample:
-                bs, fpc = _fpc_sample[0][-1][0].size()
-                mask_meters[fpc].update(bs / batch_size)
-
-            def load_clips():
-                all_clips, all_masks_enc, all_masks_pred = [], [], []
-                for fpc_sample in sample:
-                    udata, masks_enc, masks_pred = fpc_sample
-                    all_clips += [udata[0][0].to(device, non_blocking=True)]
-                    all_masks_enc += [
-                        [m.to(device, non_blocking=True) for m in masks_enc]
-                    ]
-                    all_masks_pred += [
-                        [m.to(device, non_blocking=True) for m in masks_pred]
-                    ]
-                return all_clips, all_masks_enc, all_masks_pred
-
-            clips, masks_enc, masks_pred = load_clips()
-            data_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
-
             if sync_gc and (itr + 1) % GARBAGE_COLLECT_ITR_FREQ == 0:
                 logger.info("Running garbage collection...")
                 gc.collect()
 
-            def train_step():
-                _new_lr = scheduler.step()
-                _new_wd = wd_scheduler.step()
+            # lr / wd / lambda: once per optimizer step, the same for all its micro-steps
+            _new_lr = scheduler.step()
+            _new_wd = wd_scheduler.step()
+            if lambda_progressive:
+                lambda_value_step = lambda_sched.value(epoch * ipe + itr)
+            else:
+                lambda_value_step = lambda_value
 
-                def forward_target(c, embed_dim=embed_dim_encoder):
-                    with torch.no_grad():
-                        h = target_encoder(c, gram_mode=False, training_mode=True)
-                        new_h = []
-                        for hi in h:
-                            if levels_predictor > 1:
-                                hi_0 = F.layer_norm(hi[:, :, :embed_dim], (embed_dim,))
-                                hi_1 = F.layer_norm(
-                                    hi[:, :, embed_dim : embed_dim * 2],
-                                    (embed_dim,),
-                                )
-                                hi_2 = F.layer_norm(
-                                    hi[:, :, embed_dim * 2 : embed_dim * 3],
-                                    (embed_dim,),
-                                )
-                                hi_3 = F.layer_norm(hi[:, :, -embed_dim:], (embed_dim,))
-                                hi_norm = torch.cat([hi_0, hi_1, hi_2, hi_3], dim=2)
-                                new_h.append(hi_norm)
-                            else:
-                                new_h.append(F.layer_norm(hi, (hi.size(-1),)))
-                        return new_h
+            micro_losses, micro_losses_pred, micro_losses_context = [], [], []
+            data_elapsed_time_ms = 0.0
+            gpu_etime_ms = 0.0
+            for micro_itr in range(grad_accum_steps):
+                data_start_time = time.time()
+                sample = next_sample(epoch)
+                for _fpc_sample in sample:
+                    bs, fpc = _fpc_sample[0][-1][0].size()
+                    mask_meters[fpc].update(bs / batch_size)
+                clips, masks_enc, masks_pred = load_clips(sample)
+                data_elapsed_time_ms += (time.time() - data_start_time) * 1000.0
 
-                def forward_context(clips, embed_dim=embed_dim_encoder):
-                    modality = "video"
-                    if img_temporal_dim_size is not None:
-                        if clips[0].shape[2] == img_temporal_dim_size:
-                            modality = "image"
-                    z = encoder(clips, masks_enc, gram_mode=False, training_mode=True)
-                    z_pred, z_context = predictor(
-                        z, masks_enc, masks_pred, mod=modality
+                with grad_sync([encoder, predictor], micro_step_syncs(micro_itr, grad_accum_steps, first_step)):
+                    (loss_v, loss_pred_v, loss_context_v), micro_gpu_ms = gpu_timer(
+                        functools.partial(micro_step, clips, masks_enc, masks_pred, lambda_value_step)
                     )
-                    if normalize_predictor:
-                        z_pred = normalize_nested(z_pred, embed_dim)
+                gpu_etime_ms += max(micro_gpu_ms, 0.0)  # gpu_timer returns -1 without CUDA
+                micro_losses.append(loss_v)
+                micro_losses_pred.append(loss_pred_v)
+                micro_losses_context.append(loss_context_v)
+                del sample, clips, masks_enc, masks_pred
+            first_step = False
 
-                        if predict_all:
-                            z_context = normalize_nested(z_context, embed_dim)
-                    return z_pred, z_context
+            # the step's loss: mean over its micro-batches (this rank)
+            loss = float(np.mean(micro_losses))
 
-                def loss_fn(z, h, masks_to_apply, cls_loss, d_weights):
-                    if cls_loss:
-                        h_cls = [hi[:, 0].unsqueeze(1) for hi in h]
-                        h = [
-                            apply_masks(hi[:, 1:], mi, concat=False)
-                            for hi, mi in zip(h, masks_to_apply)
-                        ]
-                        loss, n = 0, 0
-                        for zi, hi, hi_cls in zip(z, h, h_cls):
-                            for zij, hij in zip(zi, hi):
-                                h_term = torch.cat([hi_cls, hij], dim=1)
-                                loss += (
-                                    torch.mean(torch.abs(zij - h_term) ** loss_exp)
-                                    / loss_exp
-                                )
-                                n += 1
-
-                        loss /= n
-                        return loss
-                    else:
-                        h = [
-                            apply_masks(hi, mi, concat=False)
-                            for hi, mi in zip(h, masks_to_apply)
-                        ]
-
-                        if d_weights is not None:
-                            loss, n = 0, 0
-                            for zi, hi, d_i in zip(z, h, d_weights):
-                                for zij, hij, d_ij in zip(zi, hi, d_i):
-                                    loss_n = torch.abs(zij - hij) ** loss_exp * (
-                                        1 / d_ij.unsqueeze(2)
-                                    )
-                                    loss += torch.mean(loss_n) / loss_exp
-                                    n += 1
-                            loss /= n
-                            return loss
-                        else:
-                            loss, n = 0, 0
-                            for zi, hi in zip(z, h):
-                                for zij, hij in zip(zi, hi):
-                                    loss += (
-                                        torch.mean(torch.abs(zij - hij) ** loss_exp)
-                                        / loss_exp
-                                    )
-                                    n += 1
-                            loss /= n
-                            return loss
-
-                # Step 1. Forward
-                loss_context = None
-                with torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=mixed_precision):
-                    h = forward_target(clips)
-                    z_pred, z_context = forward_context(clips)
-                    loss = 0
-                    loss_pred = loss_fn(
-                        z_pred, h, masks_pred, cls_loss=has_cls_first, d_weights=None
+            # loss regulariser: decided on the step's loss, after the backward passes; a skipped step discards
+            # the accumulated gradients
+            run_step = True
+            if loss_reg_std_mult is not None:
+                meanval = np.mean(trailing_losses)
+                stdval = np.std(trailing_losses)
+                max_bound = meanval + loss_reg_std_mult * stdval
+                if (
+                    loss > max_bound
+                    and epoch > loss_reg_min_epoch
+                    and len(trailing_losses) > int(0.5 * loss_reg_num_tracking_steps)
+                ):
+                    run_step = False
+                    logger.info(
+                        f"Loss {loss} is above bound {meanval} + {loss_reg_std_mult} * {stdval}. Skipping step."
                     )
-                    loss += loss_pred
 
-                    # Context loss
-                    if predict_all:
-                        distance_weights = compute_mask_distance(
-                            masks_pred, masks_enc, grid_size, offset_context_loss
-                        )
-                        if weight_distance_loss:
-                            d_weights = distance_weights
-                        else:
-                            d_weights = None
-                        loss_context = loss_fn(
-                            z_context, h, masks_enc, cls_loss=False, d_weights=d_weights
-                        )
-                        if lambda_progressive:
-                            lambda_value_step = lambda_sched.value(epoch * ipe + itr)
-                        else:
-                            lambda_value_step = lambda_value
-                        loss += loss_context * lambda_value_step
-
-                loss_v = float(loss)
-                loss_pred_v = float(loss_pred)
-                loss_context_v = float(loss_context) if loss_context is not None else float("nan")
-
-                # Step 2. Backward & step
-                run_step = True
-                if loss_reg_std_mult is not None:
-                    meanval = np.mean(trailing_losses)
-                    stdval = np.std(trailing_losses)
-                    max_bound = meanval + loss_reg_std_mult * stdval
-                    if (
-                        loss > max_bound
-                        and epoch > loss_reg_min_epoch
-                        and len(trailing_losses)
-                        > int(0.5 * loss_reg_num_tracking_steps)
-                    ):
-                        run_step = False
-                        loss.backward()
-                        logger.info(
-                            f"Loss {loss} is above bound {meanval} + {loss_reg_std_mult} * {stdval}. Skipping step."
-                        )
-
-                grads_finite = True
-                clipped = False
-                grad_norm = float("nan")  # stays nan when the loss regulariser skipped the step
-                if run_step:
-                    if scaler is not None:
-                        scaler.scale(loss).backward()
-                        scaler.unscale_(optimizer)
-                    else:
-                        loss.backward()
-
-                    enc_params = list(encoder.parameters())
-                    pred_params = list(predictor.parameters())
-                    grad_norm = compute_grad_norm(enc_params + pred_params)
-                    grads_finite = bool(np.isfinite(grad_norm))
-
-                    if grads_finite:
-                        # after unscale_ (true grads) and the DDP all-reduce (identical on every
-                        # rank); the logged grad_norm stays the pre-clip norm
-                        clipped = clip_gradients(enc_params + pred_params, gradient_clipping, grad_norm)
-                        if scaler is not None:
-                            scaler.step(optimizer)
-                            scaler.update()
-                        else:
-                            optimizer.step()
-                    elif scaler is not None:
-                        # let the scaler back off its scale, as scaler.step() would have
-                        scaler.update()
-                optimizer.zero_grad()
-
-                # Step 3. momentum update of target encoder
-                m = min(next(momentum_scheduler), ema[1])
-                if run_step and grads_finite:
-                    with torch.no_grad():
-                        params_k = []
-                        params_q = []
-                        for param_q, param_k in zip(
-                            encoder.parameters(), target_encoder.parameters()
-                        ):
-                            params_k.append(param_k)
-                            params_q.append(param_q)
-                        torch._foreach_mul_(params_k, m)
-                        torch._foreach_add_(params_k, params_q, alpha=1 - m)
-
-                return {
-                    "loss": loss_v,
-                    "lr": _new_lr,
-                    "wd": _new_wd,
-                    "run_step": run_step,
-                    "loss_pred": loss_pred_v,
-                    "loss_context": loss_context_v,
-                    "grads_finite": grads_finite,
-                    "grad_norm": grad_norm,
-                    "clipped": clipped,
-                }
-
-            step_out, gpu_etime_ms = gpu_timer(train_step)
-            loss = step_out["loss"]
-            _new_lr = step_out["lr"]
-            _new_wd = step_out["wd"]
-            run_step = step_out["run_step"]
+            (grads_finite, clipped, grad_norm), step_gpu_ms = gpu_timer(functools.partial(finish_step, run_step))
+            gpu_etime_ms += max(step_gpu_ms, 0.0)
+            step_out = {
+                "loss_pred": float(np.mean(micro_losses_pred)),
+                "loss_context": float(np.mean(micro_losses_context)),
+                "grads_finite": grads_finite,
+                "grad_norm": grad_norm,
+                "clipped": clipped,
+            }
 
             iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
             loss_meter.update(loss)
@@ -1028,6 +1099,7 @@ def main(args, resume_preempt=False):
                         "masks: %s "
                         "[wd: %.2e] [lr: %.2e] "
                         "[grad: %.2e] "
+                        "[accum: %d] "
                         "[mem: %.2e] "
                         "[iter: %.1f ms] "
                         "[gpu: %.1f ms] "
@@ -1051,6 +1123,7 @@ def main(args, resume_preempt=False):
                             _new_wd,
                             _new_lr,
                             step_out["grad_norm"],
+                            grad_accum_steps,
                             torch.cuda.max_memory_allocated() / 1024.0**2,
                             iter_time_meter.avg,
                             gpu_time_meter.avg,

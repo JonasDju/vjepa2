@@ -113,13 +113,15 @@ optimization:
   - 0.99925
   epochs: 40
   warmup: 0
-  ipe: 300
+  ipe: 500                        # optimizer steps per epoch (each = grad_accum_steps batches per rank)
+  grad_accum_steps: 32            # batches per optimizer step and rank: global batch = 24 x 4 GPUs x 32 = 3072 (upstream: 24 x 128 GPUs)
   ipe_scale: 1.25
   weight_decay: 0.04
   final_weight_decay: 0.04
-  lr: 0.00015
-  start_lr: 0.00015
-  final_lr: 2.5e-07
+  # upstream cooldown lr schedule (vitb16/cooldown-256px-64f.yaml): linear decay 6e-4 -> 1e-6 (start_lr unused)
+  lr: 0.0006
+  start_lr: 0.0001
+  final_lr: 1.0e-06
   is_anneal: true
   resume_anneal: true
 

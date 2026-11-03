@@ -121,16 +121,16 @@ optimization:
   - 0.99925
   - 0.99925
   epochs: 300
-  warmup: 10
-  ipe: 300
+  warmup: 40                      # epochs; upstream (vitb16/pretrain-256px-16f.yaml)
+  ipe: 300                        # optimizer steps per epoch (each = grad_accum_steps batches per rank)
+  grad_accum_steps: 16            # batches per optimizer step and rank: global batch = 48 x 4 GPUs x 16 = 3072 (upstream: 48 x 64 GPUs)
   ipe_scale: 1.25
   weight_decay: 0.04
   final_weight_decay: 0.04
-  # Safe lr for global batch size 48: 1e-4 or 2e-4
-  # Use sqrt scaling for multi GPU training
-  start_lr: 0.000075
-  final_lr: 0.00015
-  lr: 0.00015
+  # upstream lr schedule for global batch 3072: linear warmup 1e-4 -> 6e-4, then constant
+  start_lr: 0.0001
+  final_lr: 0.0006
+  lr: 0.0006
   gradient_clipping: 1.0          # max global L2 norm of the encoder + predictor gradients; null = no clipping
   betas:                          # AdamW (beta_1, beta_2); the old default was [0.9, 0.999]
   - 0.9

@@ -20,9 +20,9 @@ class SubmitPretrainTest(unittest.TestCase):
         self.root = Path(self._tmp.name)
         self.repo = self.root / "repo"
         self.calls = self.root / "calls.txt"
-        self.beeond = self.root / "beeond"
+        self.tmp = self.root / "job_tmp"
         bin_dir, venv_bin, kneeno = self.root / "bin", self.repo / ".venv" / "bin", self.root / "KneeNo" / "data"
-        for directory in (bin_dir, venv_bin, kneeno, self.beeond, (self.repo / DEFAULT_CONFIG).parent):
+        for directory in (bin_dir, venv_bin, kneeno, self.tmp, (self.repo / DEFAULT_CONFIG).parent):
             directory.mkdir(parents=True)
         (kneeno / "prepare_data.py").touch()
         (self.repo / DEFAULT_CONFIG).touch()
@@ -43,7 +43,7 @@ class SubmitPretrainTest(unittest.TestCase):
             "SLURM_NNODES": "1",
             "SLURM_NTASKS": "1",
             "KNEENO_DIR": str(self.root / "KneeNo"),
-            "BEEOND": str(self.beeond),
+            "TMP": str(self.tmp),
             "CUDA_VISIBLE_DEVICES": "0,1,2,3",
         }
 
@@ -56,12 +56,11 @@ class SubmitPretrainTest(unittest.TestCase):
     def test_prepares_and_trains(self):
         result, calls = self._run()
         self.assertEqual(result.returncode, 0, result.stderr)
-        # One extraction (BeeOND is one file system for the whole job), then training; no cleanup (BeeOND deletes the
-        # data when the job ends)
+        # One extraction to the job's node-local $TMP, then training; no cleanup ($TMP is deleted when the job ends)
         self.assertEqual(calls[0], "srun")
         prepare, train = calls[1:]
         self.assertIn("prepare_data.py", prepare)
-        self.assertIn(f"--data-root {self.beeond}/kneeno_data", prepare)
+        self.assertIn(f"--data-root {self.tmp}/kneeno_data", prepare)
         self.assertNotIn("--msk-tar-dir", prepare)
         self.assertEqual(
             train,
@@ -83,8 +82,8 @@ class SubmitPretrainTest(unittest.TestCase):
 
     def test_refuses_before_extracting(self):
         cases = {
-            "no beeond": ({"BEEOND": None}, "BEEOND is not a directory"),
-            "missing beeond dir": ({"BEEOND": str(self.root / "nope")}, "BEEOND is not a directory"),
+            "no tmp": ({"TMP": None}, "TMP is not a directory"),
+            "missing tmp dir": ({"TMP": str(self.root / "nope")}, "TMP is not a directory"),
             "missing config": ({"CONFIG": "configs/nope.yaml"}, "Config not found"),
             "missing kneeno": ({"KNEENO_DIR": str(self.root / "nope")}, "KneeNo not found"),
             "missing msk dir": ({"MSK_TAR_DIR": str(self.root / "nope")}, "MSK_TAR_DIR is not a directory"),

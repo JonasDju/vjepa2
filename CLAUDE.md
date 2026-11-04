@@ -29,16 +29,20 @@ On the cluster: `sbatch app/vjepa_2_1/submit_pretrain.sh` (since 2026-11-02; res
 `sbatch --export=ALL,PRETRAIN_JOB_ID=<first job's id> ...`, see below).
 - One node, one task, `--gres=gpu:4`, 128 CPUs, 24 h. It refuses more nodes or tasks: `app.main` starts the per-GPU
   processes itself. `--devices` is one `cuda:<id>` per entry of `CUDA_VISIBLE_DEVICES`.
-- `#SBATCH --beeond`: the data goes to `$BEEOND/kneeno_data` (`prepare_data.py --internal-tar-dir`, plus
-  `--msk-tar-dir` iff `MSK_TAR_DIR` is set). BeeOND is a temporary BeeGFS over the SSDs of all the job's nodes (one
-  namespace, not per node), makes the job exclusive and is deleted when the job ends. The MI configs' `data_root`
-  (pretraining and in-training eval) point there; `$BEEOND` unset leaves the literal path, and KneeNo raises.
+- The data goes to `$TMP/kneeno_data` (since 2026-11-05; `prepare_data.py --internal-tar-dir`, plus
+  `--msk-tar-dir` iff `MSK_TAR_DIR` is set): the job's folder on the node's local SSD (`/w0`, 1.5 TB), deleted when
+  the job ends. The MI configs' `data_root` (pretraining and in-training eval) point there.
+  - From 2026-11-02 to 2026-11-05 it was `$BEEOND` (`#SBATCH --beeond`, a job-wide BeeGFS). Its metadata server
+    starved the loader on millions of small JPEGs (`MA/CLAUDE.md`).
+  - `$TMP` needs a KneeNo whose `prepare_data.py` gives the extracted files fresh timestamps (`FreshTimesTarFile`).
+    The cluster's nightly cleaner (23:00) deletes `$TMP` files whose atime and mtime are both old, and tar-restored
+    ones are (2024).
 - Env vars through `--export=ALL,...`: `PRETRAIN_JOB_ID`, `CONFIG` (default the 256px pretrain config), `REPO_DIR`,
-  `KNEENO_DIR`, `MSK_TAR_DIR`. Config, KneeNo, `$BEEOND`, node/task count and GPUs are checked before extracting.
+  `KNEENO_DIR`, `MSK_TAR_DIR`. Config, KneeNo, `$TMP`, node/task count and GPUs are checked before extracting.
 - Log: `slurm_logs/pretrain.<job id>.log`, starting with the vjepa2 and KneeNo commits (`git describe --dirty`).
-- No cleanup step: BeeOND deletes the data at job end, and an `rm -rf` of millions of files would only cost node
-  time. `tests/vjepa_2_1/test_submit_pretrain.py` runs it with `srun`, `rm` and the venv's python stubbed (and checks
-  that it calls no `rm`).
+- No cleanup step: `$TMP` is deleted at job end, and an `rm -rf` of millions of files would only cost node time.
+  `tests/vjepa_2_1/test_submit_pretrain.py` runs it with `srun`, `rm` and the venv's python stubbed (and checks that
+  it calls no `rm`).
 
 Local / single GPU (also inside an sbatch script):
 ```bash
@@ -177,7 +181,7 @@ data_meta.*  -> metadata.json: { split: { case_id: { series_name: {"dimensions":
 `data.msk_subset` (default `1.0`) subsamples the MSK part only. Compute is fixed by `ipe`, so the full MSK data
 (about 2/3 of the samples) means each knee series is seen about a third as often. KneeNo raises if an MSK case id is
 in the internal metadata (any split), or if a `data_root` folder is missing. `app/vjepa_2_1/submit_pretrain.sh`
-extracts the MSK tars to `$BEEOND/kneeno_data/msk` iff `MSK_TAR_DIR` is set; set `data_root.msk` / `data_meta.msk`
+extracts the MSK tars to `$TMP/kneeno_data/msk` iff `MSK_TAR_DIR` is set; set `data_root.msk` / `data_meta.msk`
 to match.
 `split` is a global split (KneeNo `data/internal/extract_unlabeled_meta.py`); pretraining reads only `train` and
 `unlabeled` (`kneeno.dataset.PRETRAINING_SPLITS`), never `val`, the evaluation's `internal` test set. A metadata

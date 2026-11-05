@@ -15,7 +15,7 @@ data:
   msk_subset: 1.0  # subsample of the MSK part only (1.0 = all of it)
   series_depth: 24
   resample_mode: nearest  # only used when series_depth > 0: "nearest" or "interpolate"
-  batch_size: 48
+  batch_size: 64
   crop_size: 256
   patch_size: 16
   tubelet_size: 2
@@ -123,7 +123,7 @@ optimization:
   epochs: 300
   warmup: 40                      # epochs; upstream (vitb16/pretrain-256px-16f.yaml)
   ipe: 300                        # optimizer steps per epoch (each = grad_accum_steps batches per rank)
-  grad_accum_steps: 16            # batches per optimizer step and rank: global batch = 48 x 4 GPUs x 16 = 3072 (upstream: 48 x 64 GPUs)
+  grad_accum_steps: 12            # batches per optimizer step and rank: global batch = 48 x 4 GPUs x 16 = 3072 (upstream: 48 x 64 GPUs)
   ipe_scale: 1.25
   weight_decay: 0.04
   final_weight_decay: 0.04

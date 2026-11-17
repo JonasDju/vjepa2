@@ -261,6 +261,20 @@ bridge and the wiring.
   The waiting ranks sit in a NCCL barrier for the whole evaluation, which is why
   `src/utils/distributed.py` creates the process group with a 180-min timeout
   (`PROCESS_GROUP_TIMEOUT`; NCCL's default of 10 min would abort multi-GPU runs).
+- **Best model (`eval.model_selection: true`, since 2026-11-17; set in both MI configs).** After each in-training
+  eval, `update_best_model` (`train.py`) scores the metrics with a `kneeno.BestModelTracker`: the mean of
+  `internal/knn/k100/auroc` and `internal/linear_pool/auroc`. On a strict improvement it writes a full
+  `save_checkpoint` dict to `<folder>/best.pth.tar`, which `eval_classification.py` loads as `CHECKPOINT` like
+  `latest.pth.tar`.
+  - Every checkpoint carries the tracker state (`best_model`). `load_checkpoint(..., best_model_tracker=)` restores
+    it on resume, but not on a cooldown's fresh start from `anneal_ckpt` (`is_anneal`): that is a new best in its own
+    folder. Checkpoints from before have no key and start fresh.
+  - **The eval now runs before the epoch's checkpoint save**, so `latest.pth.tar` holds the best score that matches
+    `best.pth.tar`. The cost: a crash *during* an eval redoes that epoch's training.
+  - Saves go through `write_checkpoint` (`.tmp` + `os.replace`; it returns False instead of raising). A failed best
+    save keeps the previous best.
+  - The `internal/*` numbers of `best.pth.tar` are optimistic (picked on them); report `external/*`.
+  - Tests: `tests/vjepa_2_1/test_best_checkpoint.py`.
 - `app/vjepa_2_1/eval_classification.py` — standalone post-training script. Rebuilds an
   encoder via `init_video_model` (must mirror the pretraining architecture exactly, or the
   checkpoint's `state_dict` keys/shapes won't match: `model:`, plus `data:`'s `patch_size` /

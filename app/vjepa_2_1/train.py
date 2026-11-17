@@ -37,7 +37,7 @@ from app.vjepa_2_1.utils import (
     normalize_nested,
 )
 from kneeno.config import expand_env_vars
-from kneeno.evaluation import ClassificationEvaluator, tasks_due
+from kneeno.evaluation import BestModelTracker, ClassificationEvaluator, tasks_due
 from src.datasets.data_manager import init_data
 from src.datasets.kneeno_adapter import VJepa21Adapter
 from src.datasets.mi_dataset import check_series_depth
@@ -189,6 +189,51 @@ def qk_temperature_summary(model):
             at_cap = int((mod.log_temperature.detach() >= mod.log_max).sum())
             rows.append(f"{block.group(1) if block else name}:{max_t:.2f}/{at_cap}")
     return " ".join(rows) if rows else None
+
+
+def write_checkpoint(save_dict, path):
+    """``torch.save`` to ``path + ".tmp"``, then rename over ``path``.
+
+    A crash mid-write leaves the previous file intact instead of a truncated one. Returns whether it worked; a
+    failure is logged, not raised (a full disk should not kill the run).
+    """
+    tmp_path = f"{path}.tmp"
+    try:
+        torch.save(save_dict, tmp_path)
+        os.replace(tmp_path, path)
+    except Exception as e:
+        logger.info(f"Encountered exception when saving checkpoint {path}: {e}")
+        return False
+    return True
+
+
+def update_best_model(tracker, metrics, epoch, save_checkpoint, path):
+    """Save the model to ``path`` if ``metrics`` beat the best in-training evaluation so far.
+
+    :param tracker: the run's ``kneeno.BestModelTracker``. Updated on every rank (they hold the same metrics), so
+        it is in the next ``latest.pth.tar`` whichever rank writes it.
+    :param epoch: epochs completed, the checkpoint's own ``epoch`` convention.
+    :param save_checkpoint: ``save_checkpoint(epoch, path) -> bool``, which writes on rank 0 only and returns True
+        on the others. A failed save restores the previous best, so the next evaluation tries again.
+    :returns: whether the model was saved as the new best.
+    """
+    previous = tracker.state_dict()
+    if not tracker.update(metrics, epoch):
+        if tracker.last_score is not None:
+            logger.info(
+                f"[epoch {epoch}] model selection: score {tracker.last_score:.4f}, best "
+                f"{previous['best_score']:.4f} (epoch {previous['best_epoch']}) stays"
+            )
+        return False
+    if not save_checkpoint(epoch, path):
+        tracker.load_state_dict(previous)
+        logger.warning(f"[epoch {epoch}] model selection: could not save the new best model to {path}")
+        return False
+    logger.info(
+        f"[epoch {epoch}] model selection: new best score {tracker.best_score:.4f} (previous "
+        f"{previous['best_score']:.4f}, epoch {previous['best_epoch']}), saved to {path}"
+    )
+    return True
 
 
 _GLOBAL_SEED = 0
@@ -397,7 +442,9 @@ def main(args, resume_preempt=False):
     # -- EVAL (KneeNo classification evaluation, run periodically during pretraining)
     # Absent "eval:" block -> evaluation is skipped entirely.
     cfgs_eval = args.get("eval")
+    model_selection = False
     if cfgs_eval is not None:
+        model_selection = cfgs_eval.get("model_selection", False)
         # VJepa21Adapter keeps the volume depth, so the labeled volumes must be resampled too;
         # checked here rather than failing at the first evaluation batch
         check_series_depth(cfgs_eval.get("data", {}).get("series_depth"), "eval.data.series_depth")
@@ -509,6 +556,11 @@ def main(args, resume_preempt=False):
     log_file = os.path.join(folder, f"log_r{rank}.csv")
     latest_file = "latest.pth.tar"
     latest_path = os.path.join(folder, latest_file)
+    # The model of the best in-training evaluation (eval.model_selection), a full save_checkpoint dict like
+    # latest.pth.tar, so eval_classification.py loads it the same way
+    best_path = os.path.join(folder, "best.pth.tar")
+    # Its state is in every checkpoint and restored on resume; used only with eval.model_selection
+    best_model_tracker = BestModelTracker()
 
     load_path = None
     if load_model:
@@ -721,6 +773,7 @@ def main(args, resume_preempt=False):
             scaler=scaler,
             is_anneal=is_anneal and not resume_anneal,
             grad_accum_steps=grad_accum_steps,
+            best_model_tracker=best_model_tracker,
         )
         # opt.load_state_dict restored the checkpoint's betas/eps; the config wins
         apply_optimizer_hparams(optimizer, betas, eps)
@@ -735,7 +788,7 @@ def main(args, resume_preempt=False):
 
     def save_checkpoint(epoch, path):
         if rank != 0:
-            return
+            return True
         save_dict = {
             "encoder": encoder.state_dict(),
             "predictor": predictor.state_dict(),
@@ -749,11 +802,9 @@ def main(args, resume_preempt=False):
             "grad_accum_steps": grad_accum_steps,
             "global_batch_size": batch_size * world_size * grad_accum_steps,
             "lr": lr,
+            "best_model": best_model_tracker.state_dict(),
         }
-        try:
-            torch.save(save_dict, path)
-        except Exception as e:
-            logger.info(f"Encountered exception when saving checkpoint: {e}")
+        return write_checkpoint(save_dict, path)
 
     # KneeNo classification evaluation (frozen encoder, run every eval.freq.<task> epochs)
     evaluator = None
@@ -1148,25 +1199,29 @@ def main(args, resume_preempt=False):
         if qk_temps is not None:
             # block:max-temperature/heads-at-cap, cap = model.qk_temperature_max
             logger.info("[epoch %d qk-temperature] %s" % (epoch + 1, qk_temps))
-        if (epoch + 1) % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1):
-            save_checkpoint(epoch + 1, latest_path)
-            if save_every_freq > 0 and (epoch + 1) % save_every_freq == 0:
-                save_every_file = f"e{epoch}.pth.tar"
-                save_every_path = os.path.join(folder, save_every_file)
-                save_checkpoint(epoch + 1, save_every_path)
-
         # KneeNo classification evaluation (frozen encoder). Each task logs one
         # TensorBoard point per embedding-model epoch, its test metrics, so e.g.
         # the knn and linear_pool curves stay aligned even though knn has no
         # head-training epochs and linear_pool has several. Called on every
         # rank, but ClassificationEvaluator itself only does work on rank 0 and
         # broadcasts the result -> safe under DDP.
+        # Runs before the checkpoint save, so latest.pth.tar holds the best score of this epoch's evaluation: a
+        # resumed run then compares against the model that is in best.pth.tar.
         if evaluator is not None:
             due_tasks = tasks_due(epoch, evaluator.config["freq"])
             if due_tasks:
                 eval_encoder = target_encoder if evaluator.config.get("encoder", "target") == "target" else encoder
                 eval_metrics = evaluator.evaluate(eval_encoder, tasks=due_tasks, epoch=epoch)
                 logger.info(f"[epoch {epoch + 1}] eval ({due_tasks}): {eval_metrics}")
+                if model_selection:
+                    update_best_model(best_model_tracker, eval_metrics, epoch + 1, save_checkpoint, best_path)
+
+        if (epoch + 1) % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1):
+            save_checkpoint(epoch + 1, latest_path)
+            if save_every_freq > 0 and (epoch + 1) % save_every_freq == 0:
+                save_every_file = f"e{epoch}.pth.tar"
+                save_every_path = os.path.join(folder, save_every_file)
+                save_checkpoint(epoch + 1, save_every_path)
 
     if evaluator is not None:
         evaluator.cleanup()

@@ -147,7 +147,15 @@ def load_checkpoint(
     scaler,
     is_anneal=False,
     grad_accum_steps=None,
+    best_model_tracker=None,
 ):
+    """Load a training checkpoint into the models, optimizer and scaler; returns them and the epoch to resume at.
+
+    :param best_model_tracker: a ``kneeno.BestModelTracker`` to restore from the checkpoint's ``best_model`` entry
+        (``train.py::save_checkpoint``). Not restored with ``is_anneal`` (a cooldown started from the pretraining
+        checkpoint is a new run, whose best model starts over in its own folder), nor from a checkpoint written
+        before model selection existed: the tracker then keeps its fresh state.
+    """
     logger.info(f"Loading {r_path}")
     checkpoint = robust_checkpoint_loader(r_path, map_location=torch.device("cpu"))
     if grad_accum_steps is not None:
@@ -212,6 +220,13 @@ def load_checkpoint(
     if scaler is not None:
         scaler.load_state_dict(checkpoint["scaler"])
     logger.info(f"loaded optimizers from epoch {epoch}")
+    if best_model_tracker is not None and not is_anneal:
+        best_model_state = checkpoint.get("best_model")
+        if best_model_state is None:
+            logger.info("checkpoint has no model selection state (written before it existed): the best starts over")
+        else:
+            best_model_tracker.load_state_dict(best_model_state)
+            logger.info(f"restored model selection state: {best_model_tracker}")
     logger.info(f"read-path: {r_path}")
     del checkpoint
 

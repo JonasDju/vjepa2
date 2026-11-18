@@ -1215,6 +1215,8 @@ def main(args, resume_preempt=False):
                 logger.info(f"[epoch {epoch + 1}] eval ({due_tasks}): {eval_metrics}")
                 if model_selection:
                     update_best_model(best_model_tracker, eval_metrics, epoch + 1, save_checkpoint, best_path)
+                    # <tag_prefix>/model_selection/{score,best_score}, at the eval curves' (0-indexed) step
+                    evaluator.log_scalars("model_selection", best_model_tracker.scalars(), step=epoch)
 
         if (epoch + 1) % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1):
             save_checkpoint(epoch + 1, latest_path)

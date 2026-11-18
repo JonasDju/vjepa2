@@ -273,6 +273,9 @@ bridge and the wiring.
     `best.pth.tar`. The cost: a crash *during* an eval redoes that epoch's training.
   - Saves go through `write_checkpoint` (`.tmp` + `os.replace`; it returns False instead of raising). A failed best
     save keeps the previous best.
+  - Each scored eval also logs `eval/model_selection/score` and `.../best_score` to the eval TensorBoard run
+    (`evaluator.log_scalars("model_selection", best_model_tracker.scalars(), step=epoch)`, rank 0 only), at the
+    same step as the eval curves. lightly-train logs the same names.
   - The `internal/*` numbers of `best.pth.tar` are optimistic (picked on them); report `external/*`.
   - Tests: `tests/vjepa_2_1/test_best_checkpoint.py`.
 - `app/vjepa_2_1/eval_classification.py` — standalone post-training script. Rebuilds an

@@ -80,6 +80,15 @@ class UpdateBestModelTest(unittest.TestCase):
         self.assertEqual(saved["best_model"], {"best_score": 0.7, "best_epoch": 40})
         self.assertFalse(os.path.exists(self.path + ".tmp"))
 
+    def test_tracker_scalars_after_each_update(self):
+        # what train.py passes to evaluator.log_scalars("model_selection", ...)
+        self._update(0.6, 10)
+        self.assertEqual(self.tracker.scalars(), {"score": 0.6, "best_score": 0.6})
+        self._update(0.5, 20)
+        self.assertEqual(self.tracker.scalars(), {"score": 0.5, "best_score": 0.6})
+        update_best_model(self.tracker, {KNN: 0.9}, 30, self._save_checkpoint, self.path)
+        self.assertEqual(self.tracker.scalars(), {})
+
     def test_no_score_no_save(self):
         self.assertFalse(update_best_model(self.tracker, {KNN: 0.9}, 10, self._save_checkpoint, self.path))
         self.assertFalse(self._update(math.nan, 20))

@@ -1208,7 +1208,8 @@ def main(args, resume_preempt=False):
         # Runs before the checkpoint save, so latest.pth.tar holds the best score of this epoch's evaluation: a
         # resumed run then compares against the model that is in best.pth.tar.
         if evaluator is not None:
-            due_tasks = tasks_due(epoch, evaluator.config["freq"])
+            # The last epoch runs every task with a frequency set, so the final model is always evaluated
+            due_tasks = tasks_due(epoch, evaluator.config["freq"], num_epochs=num_epochs)
             if due_tasks:
                 eval_encoder = target_encoder if evaluator.config.get("encoder", "target") == "target" else encoder
                 eval_metrics = evaluator.evaluate(eval_encoder, tasks=due_tasks, epoch=epoch)

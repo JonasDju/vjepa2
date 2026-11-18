@@ -88,8 +88,8 @@ model:
   lambda_value_img: 0.5
   lambda_value_vid: 0.5
   lambda_progressive: true
-  lambda_warmup_start_iter: 7500
-  lambda_warmup_end_iter: 15000
+  lambda_warmup_start_iter: 10000
+  lambda_warmup_end_iter: 20000
   qk_norm: rms                    # one of "none", "layer", "rms"
   qk_norm_affine: false           # false: q/k norm without learnable gain (and without LayerNorm bias); true = old behaviour
   qk_temperature_max: 4.0         # learnable per-head temperature (init 1), clamped to <= this -> |logit| <= 4 * sqrt(head_dim);
@@ -118,19 +118,19 @@ model:
   zero_init_mask_tokens: true
 optimization:
   ema:
-  - 0.99925
-  - 0.99925
-  epochs: 300
-  warmup: 40                      # epochs; upstream (vitb16/pretrain-256px-16f.yaml)
+  - 0.999875                      # EMA scaling rule from Busbridge et al. 2023, "How to Scale Your EMA"
+  - 0.999875
+  epochs: 667                     # upstream: 1000
+  warmup: 30                      # epochs; upstream: 40
   ipe: 300                        # optimizer steps per epoch (each = grad_accum_steps batches per rank)
-  grad_accum_steps: 12            # batches per optimizer step and rank: global batch = 48 x 4 GPUs x 16 = 3072 (upstream: 48 x 64 GPUs)
+  grad_accum_steps: 2             # batches per optimizer step and rank: global batch = 64 x 4 GPUs x 2 = 512 (upstream: 3072)
   ipe_scale: 1.25
   weight_decay: 0.04
   final_weight_decay: 0.04
-  # upstream lr schedule for global batch 3072: linear warmup 1e-4 -> 6e-4, then constant
-  start_lr: 0.0001
-  final_lr: 0.0006
-  lr: 0.0006
+  # learning rates selected based on the sqrt-scaling law (sqrt(512/3072) * original_lr)
+  start_lr: 0.000041
+  final_lr: 0.000245
+  lr: 0.000245
   gradient_clipping: 1.0          # max global L2 norm of the encoder + predictor gradients; null = no clipping
   betas:                          # AdamW (beta_1, beta_2); the old default was [0.9, 0.999]
   - 0.9
@@ -181,9 +181,9 @@ eval:
     tensorboard_dir: /hpcwork/va105917/vjepa/pretrain_2_1/${PRETRAIN_JOB_ID}.16p.24d.vitb.256px/eval/in-training/tb
     per_label_dir: /hpcwork/va105917/vjepa/pretrain_2_1/${PRETRAIN_JOB_ID}.16p.24d.vitb.256px/eval/in-training/eval_per_label
     tag_prefix: eval
-  freq:
-    knn: 10
-    linear_pool: 10
+  freq:              # evaluation once every 7 * 300 = 2100 iterations
+    knn: 7
+    linear_pool: 7
   knn:
     k: [5, 20, 50, 100]
     metric: cosine

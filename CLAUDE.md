@@ -108,15 +108,28 @@ a config with `qk_norm: none` (the default, and the upstream configs) must set `
 ## Gradient accumulation (`optimization.grad_accum_steps`, added 2026-11-03)
 
 Upstream ViT-B trains at a global batch of 3072 (64 GPUs × 48). With `grad_accum_steps: K`, one optimizer step
-consumes K batches per rank, so global batch = `batch_size × world_size × K` (16 on 4 GPUs = 3072). It is logged at
-startup and saved in the checkpoint (`grad_accum_steps`, `global_batch_size`).
-- **The shipped MI configs use K=16 with upstream's LR schedule** (since 2026-11-03).
-  - Pretraining: 48 × 4 × 16 = 3072, warmup over 40 epochs from 1e-4 to 6e-4, then constant
-    (`vitb16/pretrain-256px-16f.yaml`). It was 1.5e-4 with warmup 10 at batch 192.
-  - Cooldown: K=32, 24 × 4 × 32 = 3072, upstream's cooldown batch (16 nodes × 8 GPUs × 24; every upstream cooldown
-    keeps 3072), with a linear decay from 6e-4 to 1e-6 (`vitb16/cooldown-256px-64f.yaml`).
-  - Kept from before: `epochs: 300` (upstream 1000), `lambda_warmup_*_iter` 7500/15000 (upstream defaults
-    15000/30000), `betas: [0.9, 0.95]` and `gradient_clipping: 1.0`.
+consumes K batches per rank, so global batch = `batch_size × world_size × K` (2 on 4 GPUs at batch 64 = 512). It is
+logged at startup and saved in the checkpoint (`grad_accum_steps`, `global_batch_size`).
+- **The pretraining config follows the thesis protocol** (since 2026-11-18): every model (both DINOv2 branches and
+  this repo) trains 200k optimizer steps at a global batch of 512. `vitb16/pretrain-MI-256px-24f.yaml`, against
+  upstream's `vitb16/pretrain-256px-16f.yaml`:
+  - Batch: 64 × 4 × 2 = 512 (upstream 3072). Length: `epochs: 667` × `ipe: 300` = 200,100 steps (upstream
+    1000 × 300).
+  - LR: upstream's, sqrt-scaled to the batch like DINOv2's (sqrt(512/3072) × upstream): warmup from 4.1e-5 to
+    2.45e-4 over `warmup: 30` epochs (upstream 1e-4 → 6e-4 over 40), then constant.
+  - EMA: `ema: 0.999875` constant (upstream 0.99925), by the EMA scaling rule m^(512/3072) (Busbridge et al. 2023,
+    "How to Scale Your EMA"). DINOv2 (official and lightly-train) doesn't scale its teacher momentum with the batch.
+  - `lambda_warmup_*_iter`: 10,000 / 20,000, 5% / 10% of the steps like upstream's defaults 15,000 / 30,000 of 300k.
+  - Kept: `weight_decay: 0.04` (constant), `ipe_scale: 1.25` (no effect here: LR, WD and EMA are constant after the
+    warmup), `betas: [0.9, 0.95]` and `gradient_clipping: 1.0`.
+  - Before (2026-11-03 to 11-18): 48 × 4 × 16 = 3072 with upstream's LR schedule, 300 epochs, EMA 0.99925, λ warmup
+    7,500 / 15,000. Before that: 1.5e-4 with warmup 10 at batch 192.
+- **The cooldown is still on the old protocol, outside the 200k budget**: `vitb16/cooldown-MI-384px-24f.yaml`,
+  K=32, 24 × 4 × 32 = 3072 (upstream's cooldown batch), a linear decay from 6e-4 to 1e-6, 40 × 500 = 20k steps.
+  It's to be moved to batch 512 with sqrt-scaled LRs once a GPU test shows which batch fits at 384px (512 isn't a
+  multiple of 24 × 4: 16 × 8 or 32 × 4). `LinearDecaySchedule` runs over `ipe_scale × epochs × ipe`, so with
+  `ipe_scale: 1.25` the decay only gets 80% of the way: it ends at ~20% of the peak LR, not `final_lr`. Upstream's
+  cooldown config is the same.
 - **Exact, not approximate.** The model has no batch-dependent layers. Each micro-batch's loss is divided by K, and
   all micro-batches have the same size (`drop_last`), so the accumulated gradient is the global-batch mean loss's.
   `MaskCollator` truncates per collated batch: K micro-batches on 4 ranks are exactly 4K ranks.
@@ -128,8 +141,8 @@ startup and saved in the checkpoint (`grad_accum_steps`, `global_batch_size`).
   - On resume, the mask collator's counter (it counts collated batches) advances `start_epoch × ipe × K`.
   - Resuming with a different K only warns.
   - `skip_batches` counts batches.
-- **Compute:** with `ipe` fixed, an epoch costs K× the data and wall time (K=16: ~16 × 0.71 s ≈ 11 s per step, ~1 h
-  per 300-step epoch on 4 GPUs).
+- **Compute:** with `ipe` fixed, an epoch costs K× the data and wall time. Measured at batch 48: ~0.71 s per
+  micro-step, so K=16 was ~11 s per step and ~1 h per 300-step epoch on 4 GPUs. Batch 64 × K=2 isn't measured yet.
 - **DDP.** Micro-steps `0..K-2` run forward + backward under `no_sync()` (`grad_sync`). The last one all-reduces
   the summed gradient.
   - **Exception:** every micro-step of the process's first optimizer step syncs (`micro_step_syncs`). The encoder's
@@ -278,6 +291,9 @@ bridge and the wiring.
     same step as the eval curves. lightly-train logs the same names.
   - The `internal/*` numbers of `best.pth.tar` are optimistic (picked on them); report `external/*`.
   - Tests: `tests/vjepa_2_1/test_best_checkpoint.py`.
+- **The last epoch evaluates every task with a frequency set** (since 2026-11-18): `tasks_due(epoch, freq,
+  num_epochs=num_epochs)`, so the final model is always evaluated and seen by model selection, even when
+  `epochs` isn't a multiple of `freq` (667 epochs at `freq: 7`).
 - `app/vjepa_2_1/eval_classification.py` — standalone post-training script. Rebuilds an
   encoder via `init_video_model` (must mirror the pretraining architecture exactly, or the
   checkpoint's `state_dict` keys/shapes won't match: `model:`, plus `data:`'s `patch_size` /
